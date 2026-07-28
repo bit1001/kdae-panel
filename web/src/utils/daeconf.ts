@@ -522,6 +522,20 @@ export function setGroupPolicy(text: string, group: Group, policy: string): stri
   return addDeclaration(text, group, 'policy: ' + policy)
 }
 
+/** 向分组末尾批量追加 filter 行,每条对应一个值。 */
+export function addGroupFilters(text: string, group: Group, values: string[]): string {
+  if (values.length === 0) return text
+  const newline = lineEnding(text)
+  const lines = values.map((v) => 'filter: ' + v)
+  const block = lines.map((l) => INDENT + INDENT + l).join(newline)
+  const lastDeclaration = [group.policy, ...group.filters]
+    .filter((p): p is GroupProperty => p !== null)
+    .reduce((furthest, p) => Math.max(furthest, p.lineEnd), -1)
+  let at = lastDeclaration < 0 ? group.section.bodyStart : lastDeclaration
+  if (text[at] === '\n' && text[at - 1] === '\r') at -= 1
+  return splice(text, at, at, newline + block)
+}
+
 /** 替换第 index 条 filter;value 为空则删除该行,index 超出范围则追加一条。 */
 export function setGroupFilter(text: string, group: Group, index: number, value: string): string {
   const existing = group.filters[index]

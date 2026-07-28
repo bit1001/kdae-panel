@@ -3,6 +3,8 @@ import { computed, ref } from 'vue'
 import {
   NButton,
   NCard,
+  NCheckbox,
+  NCheckboxGroup,
   NIcon,
   NInput,
   NInputGroup,
@@ -19,8 +21,10 @@ import {
 import { AddOutline, TrashOutline } from '@vicons/ionicons5'
 import {
   addGroup,
+  addGroupFilters,
   isValidTag,
   parseGroups,
+  readSection,
   removeGroup,
   setGroupFilter,
   setGroupPolicy,
@@ -81,13 +85,13 @@ function changeFixedIndex(group: Group, index: number | null) {
 
 const filterTarget = ref<{ group: Group; index: number } | null>(null)
 const filterValue = ref('')
+const allNodeNames = computed(() =>
+  readSection(content.value, 'node').entries.map((e) => e.tag).filter((t): t is string => t !== null),
+)
 
 function openFilterEditor(group: Group, index: number) {
   filterTarget.value = { group, index }
   filterValue.value = group.filters[index]?.value || ''
-  if (index >= group.filters.length) {
-    filterValue.value = 'name(keyword: )'
-  }
 }
 
 function applyFilter() {
@@ -95,6 +99,24 @@ function applyFilter() {
   if (!target) return
   content.value = setGroupFilter(content.value, target.group, target.index, filterValue.value.trim())
   filterTarget.value = null
+}
+
+const nodePickerVisible = ref(false)
+const selectedNodeNames = ref<string[]>([])
+
+function openNodePicker() {
+  selectedNodeNames.value = []
+  nodePickerVisible.value = true
+}
+
+function applyNodePicker() {
+  const picked = selectedNodeNames.value.filter(Boolean)
+  if (picked.length === 0) return
+  const target = filterTarget.value
+  if (!target) return
+  content.value = addGroupFilters(content.value, target.group, picked.map((n) => `name(${n})`))
+  filterTarget.value = null
+  nodePickerVisible.value = false
 }
 </script>
 
@@ -183,6 +205,11 @@ function applyFilter() {
       spellcheck="false"
       @keyup.enter="applyFilter()"
     />
+    <div class="filter-actions">
+      <NButton size="tiny" type="primary" ghost @click="openNodePicker">
+        从现有节点中选择
+      </NButton>
+    </div>
     <template #footer>
       <NSpace justify="end">
         <NButton @click="filterTarget = null">取消</NButton>
@@ -190,4 +217,24 @@ function applyFilter() {
       </NSpace>
     </template>
   </NModal>
+
+  <NModal :show="nodePickerVisible" preset="card" title="选择节点" class="orchestrate-modal" @update:show="nodePickerVisible = false">
+    <NCheckboxGroup v-model:value="selectedNodeNames">
+      <NSpace vertical size="small">
+      <NCheckbox v-for="name in allNodeNames" :key="name" :value="name" :label="name" />
+      </NSpace>
+    </NCheckboxGroup>
+    <template #footer>
+      <NSpace justify="end">
+        <NButton @click="nodePickerVisible = false">取消</NButton>
+        <NButton type="primary" @click="applyNodePicker()">添加</NButton>
+      </NSpace>
+    </template>
+  </NModal>
 </template>
+
+<style scoped>
+.filter-actions {
+  margin-top: 8px;
+}
+</style>
