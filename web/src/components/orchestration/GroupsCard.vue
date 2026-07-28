@@ -32,12 +32,6 @@ const message = useMessage()
 
 const groups = computed<Group[]>(() => parseGroups(content.value))
 const groupNames = computed(() => new Set(groups.value.map((group) => group.name)))
-const searchQuery = ref('')
-const filteredGroups = computed(() => {
-  const query = searchQuery.value.trim().toLowerCase()
-  if (!query) return groups.value
-  return groups.value.filter((g) => g.name.toLowerCase().includes(query))
-})
 
 const POLICY_OPTIONS = [
   { label: 'min_moving_avg · 移动平均延迟最小', value: 'min_moving_avg' },
@@ -91,6 +85,9 @@ const filterValue = ref('')
 function openFilterEditor(group: Group, index: number) {
   filterTarget.value = { group, index }
   filterValue.value = group.filters[index]?.value || ''
+  if (index >= group.filters.length) {
+    filterValue.value = 'name(keyword: )'
+  }
 }
 
 function applyFilter() {
@@ -104,24 +101,12 @@ function applyFilter() {
 <template>
   <NCard title="分组" class="panel-card">
     <template #header-extra>
-      <NSpace size="small" align="center">
-        <NInput
-          v-model:value="searchQuery"
-          size="tiny"
-          placeholder="name(keyword: ...)"
-          clearable
-          style="width: 180px"
-        />
-        <NTag size="small" :bordered="false">{{ filteredGroups.length }} / {{ groups.length }} 个</NTag>
-      </NSpace>
+      <NTag size="small" :bordered="false">{{ groups.length }} 个</NTag>
     </template>
     <div v-if="groups.length === 0" class="orchestrate-empty">
       <NText depth="3">还没有分组。分组是路由规则的出站目标，按策略从命中的节点中选择。</NText>
     </div>
-    <div v-if="searchQuery.trim() && filteredGroups.length === 0" class="orchestrate-empty">
-      <NText depth="3">没有匹配的分组。</NText>
-    </div>
-    <div v-for="(group, groupIndex) in filteredGroups" :key="groupIndex" class="group-item">
+    <div v-for="(group, groupIndex) in groups" :key="groupIndex" class="group-item">
       <div class="group-head">
         <code>{{ group.name }}</code>
         <NPopconfirm positive-text="删除" negative-text="取消" @positive-click="content = removeGroup(content, group)">
