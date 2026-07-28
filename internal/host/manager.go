@@ -78,15 +78,12 @@ func NewManager(serviceName, systemctl, journalctl string) (Manager, error) {
 	if serviceName == "" {
 		serviceName = "dae"
 	}
-	// 显式指定了 systemctl 路径 → 使用 systemd 后端。
-	if systemctl != "" || journalctl != "" {
-		return newSystemdManager(serviceName, systemctl, journalctl, command.ExecRunner{}, defaultTimeout)
-	}
-	// 未指定后端 → 自动检测。
+	// procd 优先：OpenWrt/ImmortalWrt 可能也有 systemctl 兼容脚本，
+	// 但 procd 的存在是更明确的 OpenWrt 标志。
 	if hasProcd() {
 		return newProcdManager(serviceName, command.ExecRunner{}, defaultTimeout)
 	}
-	return newSystemdManager(serviceName, "", "", command.ExecRunner{}, defaultTimeout)
+	return newSystemdManager(serviceName, systemctl, journalctl, command.ExecRunner{}, defaultTimeout)
 }
 
 func NewManagerWithRunner(serviceName, systemctl, journalctl string, runner command.Runner, timeout time.Duration) (Manager, error) {
