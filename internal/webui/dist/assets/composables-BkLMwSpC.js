@@ -1,0 +1,1 @@
+import{Ct as e,Tn as t}from"./client-afectMo_.js";import{f as n}from"./index-DP8dMaev.js";function r(){let r=t(n,null);return r===null&&e(`use-dialog`,`No outer <n-dialog-provider /> founded.`),r}export{r as t};

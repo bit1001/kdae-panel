@@ -32,6 +32,12 @@ const message = useMessage()
 
 const groups = computed<Group[]>(() => parseGroups(content.value))
 const groupNames = computed(() => new Set(groups.value.map((group) => group.name)))
+const searchQuery = ref('')
+const filteredGroups = computed(() => {
+  const query = searchQuery.value.trim().toLowerCase()
+  if (!query) return groups.value
+  return groups.value.filter((g) => g.name.toLowerCase().includes(query))
+})
 
 const POLICY_OPTIONS = [
   { label: 'min_moving_avg · 移动平均延迟最小', value: 'min_moving_avg' },
@@ -79,21 +85,18 @@ function changeFixedIndex(group: Group, index: number | null) {
   content.value = setGroupPolicy(content.value, group, `fixed(${index ?? 0})`)
 }
 
-// 按位置而非名称回溯分组：dae 不保证分组名唯一，重名时按名查找会改错分组。
-const filterTarget = ref<{ groupIndex: number; index: number } | null>(null)
+const filterTarget = ref<{ group: Group; index: number } | null>(null)
 const filterValue = ref('')
 
-function openFilterEditor(groupIndex: number, index: number) {
-  filterTarget.value = { groupIndex, index }
-  filterValue.value = groups.value[groupIndex]?.filters[index]?.value || ''
+function openFilterEditor(group: Group, index: number) {
+  filterTarget.value = { group, index }
+  filterValue.value = group.filters[index]?.value || ''
 }
 
 function applyFilter() {
   const target = filterTarget.value
   if (!target) return
-  const group = groups.value[target.groupIndex]
-  if (!group) return
-  content.value = setGroupFilter(content.value, group, target.index, filterValue.value.trim())
+  content.value = setGroupFilter(content.value, target.group, target.index, filterValue.value.trim())
   filterTarget.value = null
 }
 </script>
@@ -101,12 +104,24 @@ function applyFilter() {
 <template>
   <NCard title="分组" class="panel-card">
     <template #header-extra>
-      <NTag size="small" :bordered="false">{{ groups.length }} 个</NTag>
+      <NSpace size="small" align="center">
+        <NInput
+          v-model:value="searchQuery"
+          size="tiny"
+          placeholder="name(keyword: ...)"
+          clearable
+          style="width: 180px"
+        />
+        <NTag size="small" :bordered="false">{{ filteredGroups.length }} / {{ groups.length }} 个</NTag>
+      </NSpace>
     </template>
     <div v-if="groups.length === 0" class="orchestrate-empty">
       <NText depth="3">还没有分组。分组是路由规则的出站目标，按策略从命中的节点中选择。</NText>
     </div>
-    <div v-for="(group, groupIndex) in groups" :key="groupIndex" class="group-item">
+    <div v-if="searchQuery.trim() && filteredGroups.length === 0" class="orchestrate-empty">
+      <NText depth="3">没有匹配的分组。</NText>
+    </div>
+    <div v-for="(group, groupIndex) in filteredGroups" :key="groupIndex" class="group-item">
       <div class="group-head">
         <code>{{ group.name }}</code>
         <NPopconfirm positive-text="删除" negative-text="取消" @positive-click="content = removeGroup(content, group)">
@@ -148,12 +163,12 @@ function applyFilter() {
                 :closable="filter.editable"
                 @close="content = setGroupFilter(content, group, index, '')"
               >
-                <span class="filter-value" @click="filter.editable && openFilterEditor(groupIndex, index)">{{ filter.value }}</span>
+                <span class="filter-value" @click="filter.editable && openFilterEditor(group, index)">{{ filter.value }}</span>
               </NTag>
             </template>
             该条件跨行或结构复杂，为避免改坏配置，请在配置管理页编辑原文。
           </NTooltip>
-          <NButton size="tiny" dashed @click="openFilterEditor(groupIndex, group.filters.length)">
+          <NButton size="tiny" dashed @click="openFilterEditor(group, group.filters.length)">
             <template #icon><NIcon><AddOutline /></NIcon></template>
             {{ group.filters.length === 0 ? '全部节点，添加过滤' : '添加' }}
           </NButton>
