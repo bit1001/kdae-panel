@@ -162,7 +162,7 @@ onMounted(() => void refresh())
       </NGridItem>
     </NGrid>
 
-    <NGrid responsive="screen" cols="1 l:2 xl:3" :x-gap="16" :y-gap="16">
+    <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2 xl:3" :x-gap="16" :y-gap="16">
       <NGridItem>
         <NCard title="服务控制" class="panel-card">
           <template #header-extra><NTag size="small" :type="statusType">{{ service?.name || 'dae' }}</NTag></template>

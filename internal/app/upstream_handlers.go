@@ -99,11 +99,11 @@ func (j *installJobs) finish(err error) {
 
 func registerUpstreamRoutes(router *http.ServeMux, service InstallService, operations *sync.Mutex, logger *slog.Logger) {
 	if service == nil {
-		// 功能默认关闭：它需要放宽面板自身的 systemd 沙箱，
-		// 不使用的人不该承担这个代价。
+		// 功能可显式关闭；没有 Install 依赖时让端点明确告诉客户端，
+		// 而不是静默缺路由。
 		unavailable := func(writer http.ResponseWriter, _ *http.Request) {
 			writeAPIError(writer, http.StatusServiceUnavailable, "dae_install_disabled",
-				"dae 版本管理未启用，请设置 KDAE_PANEL_ENABLE_DAE_INSTALL=true 并放宽服务单元的 ReadWritePaths")
+				"dae 版本管理未启用，请设置 KDAE_PANEL_ENABLE_DAE_INSTALL=true；自定义安装路径还需加入服务单元的 ReadWritePaths")
 		}
 		for _, pattern := range []string{
 			"GET /api/v1/dae/install", "POST /api/v1/dae/install",

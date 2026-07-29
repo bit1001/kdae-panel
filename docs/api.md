@@ -21,7 +21,7 @@ X-CSRF-Token: <csrfToken>
 
 浏览器会话 Cookie 名为 `kdae_panel_session`，属性为 `HttpOnly`、`SameSite=Strict`，可配置 `Secure`。
 
-未初始化时，`/auth/status` 会返回 `bootstrapRequired: true`。前端从服务启动日志所示 URL 的 `#bootstrap=...` 片段读取 token，调用 `/auth/bootstrap` 兑换一个有效期 10 分钟、`HttpOnly`、`SameSite=Strict` 的初始化 Cookie，并立即从地址栏清除片段。`/auth/setup` 的 JSON 只包含用户名和密码，不再传输 bootstrap token。显式配置 `KDAE_PANEL_BOOTSTRAP_TOKEN` 时，启动日志会基于该固定值生成初始化链接。
+未初始化时，`/auth/status` 会返回 `bootstrapRequired: true`。前端从安装脚本所示 URL 的 `#bootstrap=...` 片段读取 token，调用 `/auth/bootstrap` 兑换一个有效期 10 分钟、`HttpOnly`、`SameSite=Strict` 的初始化 Cookie，并立即从地址栏清除片段。`/auth/setup` 的 JSON 只包含用户名和密码，不再传输 bootstrap token。显式配置 `KDAE_PANEL_BOOTSTRAP_TOKEN` 时，初始化链接会基于该固定值生成；管理员创建成功后，发行单元的临时链接文件会被删除。
 
 ## dae 能力
 
@@ -65,7 +65,7 @@ X-CSRF-Token: <csrfToken>
 
 ## dae 版本管理
 
-默认关闭。未设置 `KDAE_PANEL_ENABLE_DAE_INSTALL=true` 时，以下接口一律返回 `503 dae_install_disabled`。
+默认开启。显式设置 `KDAE_PANEL_ENABLE_DAE_INSTALL=false` 时，以下接口一律返回 `503 dae_install_disabled`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|

@@ -36,7 +36,7 @@ kdae-panel
 | systemd 单元 | 生命周期与资源状态 | 低 |
 | journald JSON | 近期日志 | 低 |
 
-启用 dae 版本管理后还会依赖四个外部契约，它们不属于 dae 本身，风险也更高：GitHub Release 的 `dae-linux-<平台>.zip` 与 `.dgst` 命名（中）、GitHub Actions 接口的 `digest` 字段（中）、`nightly.link` 的重定向服务（高，第三方），以及首次安装依赖的发布包内容——`dae.service` 里的默认路径 `/usr/bin/dae` 与 `/etc/dae/config.dae`，面板靠替换这两个字面量把单元改写到实际路径（中）。这也是该功能默认关闭的原因之一。
+默认启用的 dae 版本管理还会依赖四个外部契约，它们不属于 dae 本身，风险也更高：GitHub Release 的 `dae-linux-<平台>.zip` 与 `.dgst` 命名（中）、GitHub Actions 接口的 `digest` 字段（中）、`nightly.link` 的重定向服务（高，第三方），以及首次安装依赖的发布包内容——`dae.service` 里的默认路径 `/usr/bin/dae` 与 `/etc/dae/config.dae`，面板靠替换这两个字面量把单元改写到实际路径（中）。
 
 不稳定的内部对象、eBPF Map、Go 包、内存布局和普通日志文本均不作为控制契约。
 
@@ -91,7 +91,7 @@ daed 能展示订阅内包含哪些节点，那依赖 dae-wing 把节点写进�
 
 ## dae 版本管理
 
-默认关闭。它只做一件事：把上游的 dae 可执行文件换成你选定的版本。
+默认开启。它只做一件事：把上游的 dae 可执行文件换成你选定的版本。
 
 替换目标以 `dae.service` 的 `ExecStart` 为准，而不是面板配置里的 `KDAE_PANEL_DAE_BINARY`。两者可能不是同一个文件，若替换了后者，事务会全绿而 dae 仍在跑旧二进制——这种静默的假成功比失败更糟，因此以单元为准，并在两者不一致时明确提示。
 

@@ -12,10 +12,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/tuoro/kdae-panel/internal/atomicfile"
 	"github.com/tuoro/kdae-panel/internal/auth"
 	"github.com/tuoro/kdae-panel/internal/configstore"
 	"github.com/tuoro/kdae-panel/internal/dae"
@@ -100,6 +103,7 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		_ = authStore.Close()
 		return nil, fmt.Errorf("检查管理员初始化状态: %w", err)
 	}
+	var setupURLs []string
 	if !initialized {
 		if cfg.BootstrapToken == "" {
 			cfg.BootstrapToken, err = newBootstrapToken()
@@ -108,7 +112,7 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 				return nil, err
 			}
 		}
-		logger.Warn("首次初始化请打开一次性链接", "setup_url", bootstrapSetupURL(cfg.ListenAddress, cfg.BootstrapToken))
+		setupURLs = bootstrapSetupURLs(cfg.ListenAddress, cfg.BootstrapToken)
 	}
 	dependencies := Dependencies{
 		Dae:            daeClient,
@@ -168,6 +172,13 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		return nil, err
 	}
 	application.closers = append(application.closers, authStore)
+	if err := syncSetupURLFile(cfg.SetupURLFile, setupURLs); err != nil {
+		_ = application.Close()
+		return nil, fmt.Errorf("同步首次访问链接: %w", err)
+	}
+	for _, setupURL := range setupURLs {
+		logger.Warn("首次初始化请打开一次性链接", "setup_url", setupURL)
+	}
 	return application, nil
 }
 
@@ -259,7 +270,7 @@ func NewWithDependencies(cfg Config, logger *slog.Logger, dependencies Dependenc
 	registerScheduleRoutes(router, "/api/v1/schedule/geo", geoScheduleService)
 	registerUpstreamRoutes(router, dependencies.Install, operations, logger)
 	registerGeoRoutes(router, geo)
-	registerAuthenticationRoutes(router, dependencies.Authentication, cfg.SecureCookie, cfg.BootstrapToken, proxyTrust)
+	registerAuthenticationRoutes(router, dependencies.Authentication, cfg.SecureCookie, cfg.BootstrapToken, cfg.SetupURLFile, proxyTrust, logger)
 	apiNotFound := func(writer http.ResponseWriter, _ *http.Request) {
 		writeAPIError(writer, http.StatusNotFound, "api_not_found", "API 路径不存在")
 	}
@@ -294,6 +305,28 @@ func newBootstrapToken() (string, error) {
 	return base64.RawURLEncoding.EncodeToString(content), nil
 }
 
+// syncSetupURLFile 只在等待首次初始化时留下链接；已初始化启动会清理旧文件。
+func syncSetupURLFile(path string, setupURLs []string) error {
+	if path == "" {
+		return nil
+	}
+	if len(setupURLs) == 0 {
+		return removeSetupURLFile(path)
+	}
+	content := []byte(strings.Join(setupURLs, "\n") + "\n")
+	return atomicfile.Write(path, content, 0o600)
+}
+
+func removeSetupURLFile(path string) error {
+	if path == "" {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
+}
+
 func bootstrapSetupURL(listenAddress, token string) string {
 	fragment := "bootstrap=" + token
 	rawFragment := "bootstrap=" + strings.ReplaceAll(url.QueryEscape(token), "+", "%20")
@@ -311,6 +344,50 @@ func bootstrapSetupURL(listenAddress, token string) string {
 		Fragment:    fragment,
 		RawFragment: rawFragment,
 	}).String()
+}
+
+func bootstrapSetupURLs(listenAddress, token string) []string {
+	addresses, err := net.InterfaceAddrs()
+	if err != nil {
+		return []string{bootstrapSetupURL(listenAddress, token)}
+	}
+	return bootstrapSetupURLsForAddresses(listenAddress, token, addresses)
+}
+
+func bootstrapSetupURLsForAddresses(listenAddress, token string, addresses []net.Addr) []string {
+	fallback := bootstrapSetupURL(listenAddress, token)
+	host, port, err := net.SplitHostPort(listenAddress)
+	if err != nil || (host != "" && host != "0.0.0.0") {
+		return []string{fallback}
+	}
+
+	seen := make(map[string]struct{})
+	urls := make([]string, 0, len(addresses)+1)
+	for _, address := range addresses {
+		var ip net.IP
+		switch value := address.(type) {
+		case *net.IPNet:
+			ip = value.IP
+		case *net.IPAddr:
+			ip = value.IP
+		default:
+			continue
+		}
+		if ip = ip.To4(); ip == nil || !ip.IsPrivate() {
+			continue
+		}
+		setupURL := bootstrapSetupURL(net.JoinHostPort(ip.String(), port), token)
+		if _, exists := seen[setupURL]; exists {
+			continue
+		}
+		seen[setupURL] = struct{}{}
+		urls = append(urls, setupURL)
+	}
+	sort.Strings(urls)
+	if len(urls) > 0 {
+		return urls
+	}
+	return []string{fallback}
 }
 
 func writeAPIError(writer http.ResponseWriter, status int, code, message string) {

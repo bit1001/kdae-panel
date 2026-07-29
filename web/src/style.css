@@ -263,6 +263,26 @@ textarea {
   min-height: 220px;
 }
 
+/* 同一网格行里的卡片应共享底边；高度由该行内容最多的卡片决定。 */
+.equal-height-grid > * {
+  min-width: 0;
+  display: flex;
+}
+
+.equal-height-grid > * > .n-card {
+  width: 100%;
+}
+
+.settings-column {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.settings-column .settings-dump {
+  margin-top: 0;
+}
+
 .panel-description {
   margin: 0 0 20px;
   line-height: 1.65;

@@ -6,10 +6,13 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -1459,8 +1462,12 @@ func TestAuthenticationProtectsAPIAndChecksCSRF(t *testing.T) {
 func TestSetupRequiresBootstrapTokenAndClosesAfterInitialization(t *testing.T) {
 	session := auth.Session{Token: "session", CSRFToken: "csrf", ExpiresAt: time.Now().Add(time.Hour), User: auth.User{ID: 1, Username: "admin"}}
 	authService := &stubAuthenticationService{session: session}
+	setupURLFile := filepath.Join(t.TempDir(), "setup-url")
+	if err := os.WriteFile(setupURLFile, []byte("one-time-link\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	application, err := NewWithDependencies(
-		Config{Version: "test", BootstrapToken: "bootstrap-secret"},
+		Config{Version: "test", BootstrapToken: "bootstrap-secret", SetupURLFile: setupURLFile},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Dependencies{Dae: stubDaeService{}, Authentication: authService},
 	)
@@ -1506,6 +1513,9 @@ func TestSetupRequiresBootstrapTokenAndClosesAfterInitialization(t *testing.T) {
 	if accepted.Code != http.StatusCreated || authService.setupCalls != 1 {
 		t.Fatalf("正确 token 响应: status=%d body=%s calls=%d", accepted.Code, accepted.Body, authService.setupCalls)
 	}
+	if _, err := os.Stat(setupURLFile); !os.IsNotExist(err) {
+		t.Fatalf("管理员创建后首次访问链接文件仍然存在: %v", err)
+	}
 
 	authService.initialized = true
 	closed := httptest.NewRecorder()
@@ -1544,6 +1554,45 @@ func TestBootstrapSetupURLUsesLoopbackForWildcardListen(t *testing.T) {
 	}
 }
 
+func TestDefaultConfigListensOnLAN(t *testing.T) {
+	config := DefaultConfig()
+	if got := config.ListenAddress; got != "0.0.0.0:2023" {
+		t.Fatalf("默认监听地址 = %q，期望同时接受本机和局域网连接", got)
+	}
+	if !config.EnableDaeInstall {
+		t.Fatal("dae 版本管理应默认开启")
+	}
+}
+
+func TestBootstrapSetupURLsIncludePrivateIPv4Addresses(t *testing.T) {
+	addresses := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.50.8"), Mask: net.CIDRMask(24, 32)},
+		&net.IPNet{IP: net.ParseIP("10.20.30.40"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("203.0.113.7"), Mask: net.CIDRMask(24, 32)},
+	}
+	got := bootstrapSetupURLsForAddresses("0.0.0.0:2023", "secret", addresses)
+	want := []string{
+		"http://10.20.30.40:2023/setup#bootstrap=secret",
+		"http://192.168.50.8:2023/setup#bootstrap=secret",
+	}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("初始化链接 = %q，期望 %q", got, want)
+	}
+}
+
+func TestBootstrapSetupURLsFallBackToLoopbackWithoutLAN(t *testing.T) {
+	addresses := []net.Addr{
+		&net.IPNet{IP: net.ParseIP("127.0.0.1"), Mask: net.CIDRMask(8, 32)},
+		&net.IPNet{IP: net.ParseIP("203.0.113.7"), Mask: net.CIDRMask(24, 32)},
+	}
+	got := bootstrapSetupURLsForAddresses("0.0.0.0:2023", "secret", addresses)
+	want := "http://127.0.0.1:2023/setup#bootstrap=secret"
+	if len(got) != 1 || got[0] != want {
+		t.Fatalf("无内网地址时的初始化链接 = %q，期望 %q", got, want)
+	}
+}
+
 func TestBootstrapSetupURLEscapesConfiguredToken(t *testing.T) {
 	token := "token with & + #"
 	parsed, err := url.Parse(bootstrapSetupURL("127.0.0.1:2023", token))
@@ -1556,6 +1605,37 @@ func TestBootstrapSetupURLEscapesConfiguredToken(t *testing.T) {
 	}
 	if values.Get("bootstrap") != token {
 		t.Fatalf("初始化链接 token = %q，期望 %q", values.Get("bootstrap"), token)
+	}
+}
+
+func TestSyncSetupURLFileWritesPrivateFileAndRemovesStaleFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "runtime", "setup-url")
+	urls := []string{
+		"http://10.0.0.2:2023/setup#bootstrap=first",
+		"http://10.0.0.3:2023/setup#bootstrap=second",
+	}
+	if err := syncSetupURLFile(path, urls); err != nil {
+		t.Fatal(err)
+	}
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := string(content), strings.Join(urls, "\n")+"\n"; got != want {
+		t.Fatalf("交接文件内容 = %q，期望 %q", got, want)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); runtime.GOOS != "windows" && got != 0o600 {
+		t.Fatalf("交接文件权限 = %o，期望 600", got)
+	}
+	if err := syncSetupURLFile(path, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("已初始化启动后旧交接文件仍然存在: %v", err)
 	}
 }
 

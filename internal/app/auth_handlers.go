@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -51,7 +52,7 @@ type authStatusResponse struct {
 	BootstrapAuthorized bool       `json:"bootstrapAuthorized,omitempty"`
 }
 
-func registerAuthenticationRoutes(router *http.ServeMux, service AuthenticationService, secureCookie bool, bootstrapToken string, proxyTrust proxyTrust) {
+func registerAuthenticationRoutes(router *http.ServeMux, service AuthenticationService, secureCookie bool, bootstrapToken, setupURLFile string, proxyTrust proxyTrust, logger *slog.Logger) {
 	if service == nil {
 		return
 	}
@@ -153,6 +154,10 @@ func registerAuthenticationRoutes(router *http.ServeMux, service AuthenticationS
 			return
 		}
 		setupLimiter.Success(setupKey)
+		if err := removeSetupURLFile(setupURLFile); err != nil {
+			// 管理员已经创建成功，不能因清理提示文件失败而把成功响应改成错误。
+			logger.Warn("删除首次访问链接文件失败", "path", setupURLFile, "error", err)
+		}
 		setRequestUser(writer, session.User.Username)
 		clearSetupAuthorizationCookie(writer, secureCookie || proxyTrust.requestScheme(request) == "https")
 		setSessionCookie(writer, session, secureCookie || proxyTrust.requestScheme(request) == "https")

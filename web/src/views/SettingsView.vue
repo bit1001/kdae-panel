@@ -83,7 +83,7 @@ async function downloadSysdump() {
       </div>
     </div>
 
-    <NGrid responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
+    <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
       <NGridItem>
         <NCard title="修改管理员密码" class="panel-card">
           <template #header-extra><NIcon size="20"><KeyOutline /></NIcon></template>
@@ -105,7 +105,7 @@ async function downloadSysdump() {
         </NCard>
       </NGridItem>
 
-      <NGridItem>
+      <NGridItem class="settings-column">
         <NCard title="账户信息" class="panel-card">
           <dl class="details-list">
             <div><dt>用户名</dt><dd>{{ auth.user?.username || '—' }}</dd></div>

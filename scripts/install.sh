@@ -71,6 +71,10 @@ fi
 
 install -Dm0644 "${service_file}" /etc/systemd/system/kdae-panel.service
 systemctl daemon-reload
+setup_url_file=/run/kdae-panel/setup-url
+# systemctl restart 通常会重建 RuntimeDirectory；这里仍先删精确路径，避免异常退出留下的
+# 旧链接被当成本次结果。新进程会在尚未初始化时原子写回。
+rm -f "${setup_url_file}"
 # 升级场景必须重启：enable --now 对已在运行的服务是空操作，
 # 旧二进制会继续跑，升级看似成功实则没有生效。
 if systemctl is-active --quiet kdae-panel.service; then
@@ -79,8 +83,22 @@ else
   systemctl enable --now kdae-panel.service
 fi
 
-echo "kdae-panel 已启动：http://127.0.0.1:2023"
-echo "面板只监听本机回环地址；从其他机器访问请先建立 SSH 端口转发："
-echo "  ssh -L 2023:127.0.0.1:2023 root@<这台机器>"
-echo "首次初始化请通过 journalctl -u kdae-panel -n 20 --no-pager 查看并打开 setup_url。"
+setup_urls=""
+for ((attempt = 0; attempt < 40; attempt++)); do
+  if [[ -s ${setup_url_file} ]]; then
+    setup_urls=$(awk 'NF && !seen[$0]++' "${setup_url_file}")
+    break
+  fi
+  sleep 0.25
+done
+
+echo "kdae-panel 已启动，默认监听 0.0.0.0:2023（本机和局域网均可访问）。"
+if [[ -n ${setup_urls} ]]; then
+  echo "首次访问地址："
+  while IFS= read -r setup_url; do
+    echo "  ${setup_url}"
+  done <<<"${setup_urls}"
+else
+  echo "面板已经初始化；请通过这台机器的内网地址访问 2023 端口。"
+fi
 echo "卸载：sudo bash /usr/share/kdae-panel/uninstall.sh"

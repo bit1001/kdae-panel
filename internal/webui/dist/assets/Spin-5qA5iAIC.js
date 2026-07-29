@@ -1,4 +1,4 @@
-import{$n as e,A as t,C as n,Cn as r,Hn as i,Kt as a,Qt as o,S as s,Ut as c,Xt as l,dt as u,ft as d,pn as f,qt as p,rn as m,x as h,xn as g}from"./client-afectMo_.js";import{i as _}from"./text-Cz55FHMX.js";import{o as v}from"./index-BdYRkzJ9.js";var y=a([a(`@keyframes spin-rotate`,`
+import{$n as e,A as t,C as n,Cn as r,Hn as i,Kt as a,Qt as o,S as s,Ut as c,Xt as l,dt as u,ft as d,pn as f,qt as p,rn as m,x as h,xn as g}from"./client-afectMo_.js";import{i as _}from"./text-Cz55FHMX.js";import{o as v}from"./index-B4F85U1r.js";var y=a([a(`@keyframes spin-rotate`,`
  from {
  transform: rotate(0);
  }

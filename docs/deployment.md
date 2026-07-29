@@ -3,7 +3,7 @@
 ## 前置条件
 
 - Linux 与 systemd；
-- 已安装并能够通过 `systemctl status dae` 正常运行的 dae——若这台机器上还没有 dae，可以启用下面的 dae 版本管理，由面板完成首次安装；
+- 已安装并能够通过 `systemctl status dae` 正常运行的 dae——若这台机器上还没有 dae，可直接使用默认开启的版本管理完成首次安装；
 - `/etc/dae/config.dae` 是实际入口配置（首次安装时由面板写入不劫持流量的种子配置）；
 - 构建阶段需要 Go 1.25.12+ 和 Node.js 22+；
 - 运行阶段不需要 Node.js。
@@ -57,21 +57,17 @@ sudo ./scripts/install.sh
 
 ## 首次访问
 
-面板默认只监听 `127.0.0.1:2023`。从其他机器访问请先建立 SSH 端口转发：
+新安装默认监听 `0.0.0.0:2023`，同时接受本机和局域网连接：
 
-```bash
-ssh -L 2023:127.0.0.1:2023 root@router.example
+```text
+http://<面板机器的内网 IP>:2023
 ```
 
-然后打开 `http://127.0.0.1:2023`。首次启动会在服务日志里生成一次性初始化链接：
+首次安装完成后，脚本会枚举本机 RFC1918 内网 IPv4，并在终端的「首次访问地址」下直接打印完整的一次性初始化链接。多网卡机器可能出现多条，选择当前设备能访问的那一条即可；只有完全检测不到内网地址时才回退到本机链接。发行单元用权限为 `0600` 的 `/run/kdae-panel/setup-url` 把本次链接交给安装脚本，不依赖 journald 文本格式；页面完成管理员创建后，该临时文件立即删除，初始化接口也永久关闭。
 
-```bash
-sudo journalctl -u kdae-panel -n 20 --no-pager
-```
+`0.0.0.0` 只是监听通配地址，不能直接放进浏览器，所以不会作为链接输出。通过 HTTPS 反向代理访问时，保留任一链接的 `/setup#bootstrap=...` 部分，并将协议和主机替换为实际面板地址；URL 片段不会发送给反向代理或写入访问日志。局域网直连是明文 HTTP，只适合可信内网；跨不可信网络请使用 HTTPS 或 SSH 隧道。
 
-找到 `setup_url` 并打开，页面会自动完成授权，注册表单只需填写用户名和密码。创建管理员后初始化接口永久关闭。
-
-`setup_url` 默认使用面板的直接监听地址。通过 HTTPS 反向代理访问时，保留 `/setup#bootstrap=...` 部分，并将其协议和主机替换为实际面板地址；URL 片段不会发送给反向代理或写入访问日志。
+升级不会覆盖已有的 `/etc/kdae-panel/kdae-panel.env`。旧安装若要采用新默认值，需要手动把 `KDAE_PANEL_LISTEN` 改为 `0.0.0.0:2023` 后重启。
 
 ## 配置项
 
@@ -83,8 +79,8 @@ sudo systemctl restart kdae-panel
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
-| `KDAE_PANEL_LISTEN` | `127.0.0.1:2023` | HTTP 监听地址 |
-| `KDAE_PANEL_BOOTSTRAP_TOKEN` | 空 | 一次性初始化链接的根凭证；留空时启动自动生成并仅写入服务日志中的 `setup_url` |
+| `KDAE_PANEL_LISTEN` | `0.0.0.0:2023` | HTTP 监听地址；默认接受本机与所有 IPv4 网卡的连接 |
+| `KDAE_PANEL_BOOTSTRAP_TOKEN` | 空 | 一次性初始化链接的根凭证；留空时启动自动生成，发行单元会写入临时交接文件并同时记录 `setup_url` 日志 |
 | `KDAE_PANEL_TRUSTED_PROXIES` | `127.0.0.0/8,::1/128` | 可以转发客户端地址和协议的代理 CIDR，逗号分隔 |
 | `KDAE_PANEL_DAE_BINARY` | `/usr/bin/dae` | dae 二进制路径 |
 | `KDAE_PANEL_DAE_CONFIG` | `/etc/dae/config.dae` | dae 入口配置 |
@@ -95,49 +91,21 @@ sudo systemctl restart kdae-panel
 | `KDAE_PANEL_BACKUP_DIR` | `/var/lib/kdae-panel/backups` | 配置备份目录 |
 | `KDAE_PANEL_SCHEDULE_FILE` | `/var/lib/kdae-panel/schedule.json` | 订阅自动刷新的设置与上次执行时间 |
 | `KDAE_PANEL_INSTALL_STATE_FILE` | `/var/lib/kdae-panel/dae-install.json` | dae 版本安装记录，同前缀下还存放回滚用的上一版二进制 |
-| `KDAE_PANEL_ENABLE_DAE_INSTALL` | `false` | 允许通过面板安装与切换 dae 版本，开启后还需放宽单元的 `ReadWritePaths` |
+| `KDAE_PANEL_ENABLE_DAE_INSTALL` | `true` | 允许通过面板首次安装、升级与切换 dae 版本 |
 | `KDAE_PANEL_GEO_STATE_FILE` | `/var/lib/kdae-panel/geo-update.json` | geo 数据更新记录 |
 | `KDAE_PANEL_GEO_SCHEDULE_FILE` | `/var/lib/kdae-panel/geo-schedule.json` | geo 自动更新的设置与上次执行时间 |
 | `KDAE_PANEL_ENABLE_GEO_UPDATE` | `false` | 允许一键更新 geo 数据，与上一项相互独立 |
 | `KDAE_PANEL_DISABLE_UPDATE_CHECK` | `false` | 关闭面板自身的新版本检查（检查只读取本仓库 releases/latest 的 tag，结果缓存 6 小时） |
-| `KDAE_PANEL_ENABLE_SELF_UPDATE` | `false` | 允许面板一键升级自身，需放宽 `ReadWritePaths` |
+| `KDAE_PANEL_ENABLE_SELF_UPDATE` | `false` | 允许面板一键升级自身；默认安装路径 `/usr/bin` 已可写 |
 | `KDAE_PANEL_BACKUP_FILE` | `/var/lib/kdae-panel/kdae-panel.previous` | 自升级保留的上一版面板二进制 |
 | `KDAE_PANEL_SESSION_TTL` | `12h` | 会话绝对有效期 |
 | `KDAE_PANEL_SECURE_COOKIE` | `false` | Cookie 是否仅允许 HTTPS |
 
-### 启用 dae 版本管理
+### dae 版本管理
 
-该功能默认关闭。开启需要两步，缺一不可：
+新安装默认开启，发行单元已经允许写入默认二进制目录 `/usr/bin` 和服务单元目录 `/etc/systemd/system`，因此可以直接完成首次安装、升级与版本切换。dae 若实际位于其他目录，先用 `systemctl show dae --property=ExecStart` 确认路径，再通过 `systemctl edit kdae-panel` 把该目录加入 `ReadWritePaths`。
 
-```bash
-# 1. 把 env 文件里那一行改为 true。
-#    升级安装的 env 文件可能还没有这一行，此时 sed 是静默空操作——
-#    因此有则改、无则追加，最后数一遍确认只有一行（两行同名变量时后一行生效，很难排查）。
-env_file=/etc/kdae-panel/kdae-panel.env
-if grep -q '^KDAE_PANEL_ENABLE_DAE_INSTALL=' "$env_file"; then
-  sed -i 's/^KDAE_PANEL_ENABLE_DAE_INSTALL=.*/KDAE_PANEL_ENABLE_DAE_INSTALL=true/' "$env_file"
-else
-  echo 'KDAE_PANEL_ENABLE_DAE_INSTALL=true' >> "$env_file"
-fi
-grep -c '^KDAE_PANEL_ENABLE_DAE_INSTALL=' "$env_file"   # 必须输出 1
-
-# 2. 让面板能写入 dae 可执行文件所在目录（以服务实际启动的路径为准）
-systemctl show dae --property=ExecStart
-systemctl edit kdae-panel    # 追加 ReadWritePaths=/usr/local/bin
-
-systemctl restart kdae-panel
-```
-
-第二步的目录通常在 root 的 `PATH` 上，开放它意味着面板的任何缺陷都可能升级为命令劫持。只在确实需要通过面板管理 dae 版本时才开启；只读部署或用包管理器维护 dae 的场景应保持关闭。
-
-**若还想用面板完成 dae 的首次安装**，再加一个目录，让面板能写入服务单元：
-
-```bash
-systemctl edit kdae-panel    # 追加 ReadWritePaths=/etc/systemd/system
-systemctl restart kdae-panel
-```
-
-这一条的代价更大：能写 `/etc/systemd/system` 就等于能定义以 root 运行的服务。面板在动手前会逐个探测这些目录是否真的可写，缺哪个会在界面上直接说明，不会在中途失败。
+不需要版本管理的部署可以把 `KDAE_PANEL_ENABLE_DAE_INSTALL` 改为 `false`，并用 systemd drop-in 收紧上述写目录。允许写 root 的可执行文件和服务单元意味着面板缺陷可能升级为任意代码执行，这是默认便利性所接受的权限代价。
 
 首次安装会写入可执行文件、geo 数据、服务单元，以及一份不劫持任何流量的种子配置（仅在配置不存在时）。**它不会自动启动 dae**——请先在配置管理页写好规则再手动启动，否则透明代理可能切断你当前的连接。已存在的服务单元与配置一律不覆盖。
 
@@ -156,8 +124,6 @@ else
 fi
 test "$(sudo grep -c '^KDAE_PANEL_ENABLE_SELF_UPDATE=' "$env_file")" -eq 1
 
-# 让面板能写入自己所在的目录
-sudo systemctl edit kdae-panel    # 追加 ReadWritePaths=/usr/bin
 sudo systemctl restart kdae-panel
 ```
 

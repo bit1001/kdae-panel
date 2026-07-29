@@ -188,7 +188,7 @@ onMounted(() => void load())
       <div class="page-stack">
         <NodesCard v-model="content" />
 
-        <NGrid responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
+        <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
           <NGridItem>
             <SubscriptionsCard v-model="content" :dirty="dirty" />
           </NGridItem>

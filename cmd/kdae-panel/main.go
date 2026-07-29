@@ -53,6 +53,7 @@ func run() error {
 	}
 	listen := flag.String("listen", envOr("KDAE_PANEL_LISTEN", cfg.ListenAddress), "HTTP 监听地址")
 	bootstrapToken := flag.String("bootstrap-token", envOr("KDAE_PANEL_BOOTSTRAP_TOKEN", cfg.BootstrapToken), "首次初始化 bootstrap token")
+	setupURLFile := flag.String("setup-url-file", envOr("KDAE_PANEL_SETUP_URL_FILE", cfg.SetupURLFile), "首次初始化链接临时文件")
 	trustedProxies := flag.String("trusted-proxies", envOr("KDAE_PANEL_TRUSTED_PROXIES", cfg.TrustedProxies), "可信反向代理 CIDR，逗号分隔")
 	daeBinary := flag.String("dae-binary", envOr("KDAE_PANEL_DAE_BINARY", cfg.DaeBinary), "dae 可执行文件路径")
 	daeConfig := flag.String("dae-config", envOr("KDAE_PANEL_DAE_CONFIG", cfg.DaeConfigPath), "dae 入口配置文件路径")
@@ -81,6 +82,7 @@ func run() error {
 	}
 	cfg.ListenAddress = *listen
 	cfg.BootstrapToken = *bootstrapToken
+	cfg.SetupURLFile = *setupURLFile
 	cfg.TrustedProxies = *trustedProxies
 	cfg.DaeBinary = *daeBinary
 	cfg.DaeConfigPath = *daeConfig
