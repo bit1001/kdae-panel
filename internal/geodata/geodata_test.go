@@ -68,7 +68,7 @@ type fakeReloader struct {
 func (r *fakeReloader) Reload(context.Context) error {
 	r.calls++
 	if r.failFirst && r.calls == 1 {
-		return errors.New("dae 拒绝了新的 geo 数据")
+		return errors.New("code twitter not found in /etc/dae/geosite.dat")
 	}
 	return nil
 }
@@ -191,6 +191,8 @@ func TestUpdateRestoresPreviousDataWhenReloadFails(t *testing.T) {
 	}
 	if _, err := manager.Apply(context.Background(), data); err == nil {
 		t.Fatal("reload 失败时更新应报错")
+	} else if !strings.Contains(err.Error(), "geosite:twitter") || !strings.Contains(err.Error(), "Geo 数据") {
+		t.Fatalf("reload 失败应指出缺失分类和处理入口：%v", err)
 	}
 
 	for name, want := range map[string]string{

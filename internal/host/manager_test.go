@@ -4,12 +4,44 @@ import (
 	"context"
 	"errors"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/tuoro/kdae-panel/internal/command"
 )
+
+func TestInterfacesAreSorted(t *testing.T) {
+	manager := &Manager{}
+	interfaces, err := manager.Interfaces(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(interfaces) == 0 {
+		t.Fatal("系统至少应暴露一个网络接口")
+	}
+	for index, item := range interfaces {
+		if item.Name == "" {
+			t.Fatal("接口名不能为空")
+		}
+		if index > 0 && interfaces[index-1].Name > item.Name {
+			t.Fatalf("接口未按名称排序: %+v", interfaces)
+		}
+		if !sort.StringsAreSorted(item.Addresses) {
+			t.Fatalf("%s 的地址未排序: %v", item.Name, item.Addresses)
+		}
+	}
+}
+
+func TestInterfacesHonorCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := &Manager{}
+	if _, err := manager.Interfaces(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("错误 = %v，期望 context.Canceled", err)
+	}
+}
 
 type fakeRunner struct {
 	results map[string]command.Result
@@ -86,17 +118,25 @@ func TestParseExecStartPath(t *testing.T) {
 func TestActionAllowlist(t *testing.T) {
 	runner := &fakeRunner{results: map[string]command.Result{
 		"systemctl restart dae": {},
+		"systemctl enable dae":  {},
+		"systemctl disable dae": {},
 	}, errors: map[string]error{}}
 	manager, _ := NewManagerWithRunner("dae", "systemctl", "journalctl", runner, time.Second)
 	if err := manager.Action(context.Background(), ActionRestart); err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []Action{"mask", "disable", "isolate", "poweroff"} {
+	if err := manager.Action(context.Background(), ActionEnable); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Action(context.Background(), ActionDisable); err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []Action{"mask", "isolate", "poweroff"} {
 		if err := manager.Action(context.Background(), forbidden); err == nil {
 			t.Fatalf("未允许的动作 %q 应该被拒绝", forbidden)
 		}
 	}
-	want := []string{"systemctl restart dae"}
+	want := []string{"systemctl restart dae", "systemctl enable dae", "systemctl disable dae"}
 	if !reflect.DeepEqual(runner.calls, want) {
 		t.Fatalf("命令调用 = %v，期望 %v", runner.calls, want)
 	}

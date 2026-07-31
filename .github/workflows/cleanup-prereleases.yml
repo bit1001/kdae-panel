@@ -1,0 +1,57 @@
+name: 清理已转正式的预发布
+
+on:
+  workflow_call:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'cleanup-prereleases-*'
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: 删除已有正式版对应的预发布与 tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          releases=$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100")
+          while IFS=$'\t' read -r release_id tag; do
+            [[ -n ${release_id} && -n ${tag} ]] || continue
+            echo "删除预发布 ${tag}"
+            gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/${release_id}"
+          done < <(jq -r '
+            [ .[] | select(.draft == false and .prerelease == false) | .tag_name ] as $stable
+            | .[]
+            | select(.draft == false and .prerelease == true)
+            | select(.tag_name | test("^v[0-9]+\\.[0-9]+\\.[0-9]+-"))
+            | .tag_name as $tag
+            | ($tag | split("-")[0]) as $base
+            | select($stable | index($base))
+            | [.id, $tag] | @tsv
+          ' <<<"${releases}")
+
+          while IFS= read -r tag; do
+            [[ ${tag} =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]] || continue
+            base=${tag%%-*}
+            if git show-ref --verify --quiet "refs/tags/${base}"; then
+              echo "删除预发布 tag ${tag}"
+              git push origin --delete "${tag}"
+            fi
+          done < <(git tag --list 'v*-*')
+
+          # 本机没有 GitHub CLI 时可推一个专用 tag 触发清理；任务结束后自删，
+          # 不让维护用标签反过来污染版本列表。workflow_call/手工触发不走这里。
+          if [[ ${GITHUB_REF_TYPE} == tag && ${GITHUB_REF_NAME} == cleanup-prereleases-* ]]; then
+            echo "删除维护触发 tag ${GITHUB_REF_NAME}"
+            git push origin --delete "${GITHUB_REF_NAME}"
+          fi

@@ -7,3 +7,5 @@
 *.woff binary
 *.woff2 binary
 
+# Vite 产物含上游组件注入的 CSS 字符串，尾随空格由构建器生成。
+internal/webui/dist/** -whitespace

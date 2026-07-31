@@ -39,7 +39,7 @@ export interface EntryAction {
 }
 
 /** 跨行条目无法按行安全改写，把操作禁用并说明原因。 */
-export function entryActions(entry: Entry, actions: EntryAction[]) {
+export function entryActions(entry: Entry, actions: EntryAction[], labels = false) {
   const buttons = actions.map((action) => h(NButton, {
     size: 'tiny',
     quaternary: true,
@@ -47,11 +47,16 @@ export function entryActions(entry: Entry, actions: EntryAction[]) {
     title: action.title,
     disabled: !entry.editable,
     onClick: action.onClick,
-  }, { icon: () => h(NIcon, null, { default: () => h(action.icon) }) }))
+  }, labels
+    ? {
+        default: () => action.title,
+        icon: () => h(NIcon, null, { default: () => h(action.icon) }),
+      }
+    : { icon: () => h(NIcon, null, { default: () => h(action.icon) }) }))
   const row = h(NSpace, { size: 'small', wrap: false }, { default: () => buttons })
   if (entry.editable) return row
   return h(NTooltip, null, {
     trigger: () => h('span', null, [row]),
-    default: () => '该条目跨行书写，无法安全地按行改写，请在配置管理页编辑原文。',
+    default: () => '该条目跨行书写，无法安全地按行改写，请使用卡片右上角的原文编辑。',
   })
 }

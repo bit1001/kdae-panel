@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/tuoro/kdae-panel/internal/atomicfile"
@@ -143,6 +144,12 @@ func (m *Manager) Status(ctx context.Context) Status {
 		// 每次都把选择重置回默认值等于诱导用户反复来回切。
 		if state.Source != "" {
 			status.DefaultSource = state.Source
+			if !slices.ContainsFunc(status.Sources, func(info upstream.GeoSourceInfo) bool {
+				return info.Source == state.Source
+			}) {
+				status.Warnings = append(status.Warnings,
+					fmt.Sprintf("上次使用的 geo 来源 %s 已不存在；自动更新会保持失败而不会静默切换规则集，请先选择一个现有来源手动更新", state.Source))
+			}
 		}
 	}
 
@@ -152,7 +159,7 @@ func (m *Manager) Status(ctx context.Context) Status {
 		return status
 	}
 	status.Updatable = true
-	status.Warnings = warnings(files, target, filepath.Dir(m.configPath))
+	status.Warnings = append(status.Warnings, warnings(files, target, filepath.Dir(m.configPath))...)
 	return status
 }
 

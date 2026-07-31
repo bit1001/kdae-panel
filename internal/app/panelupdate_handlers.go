@@ -19,12 +19,17 @@ type PanelReleaseChecker func(ctx context.Context) (string, error)
 // PanelUpdateService 是面板自升级能力的消费者侧接口。
 type PanelUpdateService interface {
 	Status(ctx context.Context) panelupdate.Status
+	SetEnabled(enabled bool) error
 	Download(ctx context.Context, version string) (upstream.PanelBinary, error)
 	Apply(ctx context.Context, binary upstream.PanelBinary) error
 }
 
 type panelUpdateRequest struct {
 	Version string `json:"version"`
+}
+
+type panelUpdatePreferenceRequest struct {
+	Enabled *bool `json:"enabled"`
 }
 
 type panelUpdate struct {
@@ -39,28 +44,37 @@ const (
 	// 这是给人看的提醒，不追求新鲜度；但绝不能把 GitHub 接口打成限流。
 	panelUpdateCacheOK   = 6 * time.Hour
 	panelUpdateCacheFail = 15 * time.Minute
+	// 手动检查用于发布后立即确认，短时间内重复点击不应再次请求 GitHub。
+	panelUpdateForceCooldown = time.Minute
 	// 自升级要下载几兆的发布包，给得比接口超时宽裕。
 	panelUpdateTimeout = 10 * time.Minute
 )
 
-// registerPanelUpdateRoutes 提供面板自身的版本检查与（可选的）一键自升级。
+// registerPanelUpdateRoutes 提供面板自身的版本检查与一键自升级。
 //
 // checker 为 nil 表示检查被关闭（KDAE_PANEL_DISABLE_UPDATE_CHECK），
-// service 为 nil 表示自升级未启用（KDAE_PANEL_ENABLE_SELF_UPDATE）——
-// 两者独立：只想要提醒、不想给面板改写自身二进制的权限，是合理的部署选择。
+// service 只在测试或不完整的嵌入部署中允许为空；正式程序始终创建管理器，
+// 启用状态由它自己持久化，界面因此随时能开关而不需要 SSH。
 func registerPanelUpdateRoutes(router *http.ServeMux, current string, checker PanelReleaseChecker,
 	service PanelUpdateService, operations *sync.Mutex, logger *slog.Logger) {
 	var mu sync.Mutex
 	var cached panelUpdate
 	var expiresAt time.Time
+	var lastForcedCheck time.Time
 	jobs := &installJobs{job: Job{Phase: PhaseIdle}}
 
-	check := func(ctx context.Context) panelUpdate {
+	check := func(ctx context.Context, force bool) panelUpdate {
 		mu.Lock()
 		defer mu.Unlock()
 		now := time.Now()
-		if now.Before(expiresAt) {
+		if !force && now.Before(expiresAt) {
 			return cached
+		}
+		if force && !lastForcedCheck.IsZero() && now.Sub(lastForcedCheck) < panelUpdateForceCooldown {
+			return cached
+		}
+		if force {
+			lastForcedCheck = now
 		}
 		result := panelUpdate{Current: current, CheckedAt: now.UTC()}
 		ttl := panelUpdateCacheOK
@@ -80,19 +94,48 @@ func registerPanelUpdateRoutes(router *http.ServeMux, current string, checker Pa
 		return cached
 	}
 
-	router.HandleFunc("GET /api/v1/panel/update", func(writer http.ResponseWriter, request *http.Request) {
-		payload := map[string]any{"check": check(request.Context())}
+	payload := func(ctx context.Context, force bool) map[string]any {
+		result := map[string]any{"check": check(ctx, force)}
 		if service != nil {
-			payload["status"] = service.Status(request.Context())
-			payload["job"] = jobs.snapshot()
+			result["status"] = service.Status(ctx)
+			result["job"] = jobs.snapshot()
 		}
-		writeJSON(writer, http.StatusOK, payload)
+		return result
+	}
+
+	router.HandleFunc("GET /api/v1/panel/update", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, payload(request.Context(), false))
+	})
+
+	router.HandleFunc("POST /api/v1/panel/update/check", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, payload(request.Context(), true))
+	})
+
+	router.HandleFunc("PUT /api/v1/panel/update/preference", func(writer http.ResponseWriter, request *http.Request) {
+		if service == nil {
+			writeAPIError(writer, http.StatusServiceUnavailable, "panel_self_update_unavailable",
+				"当前部署不支持面板自升级")
+			return
+		}
+		var payload panelUpdatePreferenceRequest
+		if !decodeSmallJSONBody(writer, request, &payload) {
+			return
+		}
+		if payload.Enabled == nil {
+			writeAPIError(writer, http.StatusBadRequest, "invalid_self_update_preference", "必须指定 enabled")
+			return
+		}
+		if err := service.SetEnabled(*payload.Enabled); err != nil {
+			writeAPIError(writer, http.StatusInternalServerError, "self_update_preference_failed", err.Error())
+			return
+		}
+		writeJSON(writer, http.StatusOK, map[string]any{"status": service.Status(request.Context())})
 	})
 
 	router.HandleFunc("POST /api/v1/panel/update", func(writer http.ResponseWriter, request *http.Request) {
 		if service == nil {
-			writeAPIError(writer, http.StatusServiceUnavailable, "panel_self_update_disabled",
-				"面板自升级未启用，请设置 KDAE_PANEL_ENABLE_SELF_UPDATE=true")
+			writeAPIError(writer, http.StatusServiceUnavailable, "panel_self_update_unavailable",
+				"当前部署不支持面板自升级")
 			return
 		}
 		payload := panelUpdateRequest{}
@@ -105,6 +148,11 @@ func registerPanelUpdateRoutes(router *http.ServeMux, current string, checker Pa
 			return
 		}
 		status := service.Status(request.Context())
+		if !status.Enabled {
+			writeAPIError(writer, http.StatusConflict, "panel_self_update_disabled",
+				"面板一键升级已关闭，可在设置页或更新提示中直接启用")
+			return
+		}
 		if !status.Updatable {
 			writeAPIError(writer, http.StatusConflict, "panel_self_update_unavailable", status.Problem)
 			return

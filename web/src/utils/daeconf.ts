@@ -50,6 +50,10 @@ export interface RoutingRule {
   match: string
   outbound: string
   isFallback: boolean
+  /** 只有独占一行且未被跨行字符串/注释穿过时才能定点改写。 */
+  editable: boolean
+  lineStart: number
+  lineEnd: number
 }
 
 const INDENT = '  '
@@ -408,21 +412,48 @@ export function parseRoutingRules(text: string): RoutingRule[] {
   const section = scanMasked(masked.text, 0, text.length).find((candidate) => candidate.name === 'routing')
   if (!section) return []
   const rules: RoutingRule[] = []
-  let pending = ''
+  let pendingParts: string[] = []
+  let pendingStart = -1
+  let pendingEnd = -1
+  let pendingEditable = true
+  let pendingLines = 0
+  const reset = () => {
+    pendingParts = []
+    pendingStart = -1
+    pendingEnd = -1
+    pendingEditable = true
+    pendingLines = 0
+  }
+  const push = (match: string, outbound: string, isFallback: boolean) => {
+    rules.push({
+      match,
+      outbound,
+      isFallback,
+      editable: pendingLines === 1 && pendingEditable,
+      lineStart: pendingStart,
+      lineEnd: pendingEnd,
+    })
+    reset()
+  }
   for (const line of linesOf(masked, section)) {
     const content = masked.text.slice(line.start, line.end).trim()
     if (content === '') continue
-    pending = pending === '' ? content : pending + ' ' + content
-    const fallback = /^fallback\s*:\s*(.+)$/.exec(pending)
-    if (fallback) {
-      rules.push({ match: 'fallback', outbound: fallback[1], isFallback: true })
-      pending = ''
+    if (pendingStart < 0) pendingStart = line.start
+    pendingEnd = line.end
+    pendingEditable = pendingEditable && line.editable
+    pendingLines += 1
+    pendingParts.push(content)
+    const pending = pendingParts.join(' ')
+    const fallback = /^fallback\s*:\s*([^\s]+)\s*$/.exec(pending)
+    if (fallback && balanced(pending)) {
+      push('fallback', fallback[1], true)
       continue
     }
     const arrow = outboundArrow(pending)
     if (arrow >= 0 && balanced(pending)) {
-      rules.push({ match: pending.slice(0, arrow).trim(), outbound: pending.slice(arrow + 2).trim(), isFallback: false })
-      pending = ''
+      const match = pending.slice(0, arrow).trim()
+      const outbound = pending.slice(arrow + 2).trim()
+      if (match !== '' && outbound !== '' && !/\s/.test(outbound)) push(match, outbound, false)
     }
   }
   return rules
@@ -449,6 +480,8 @@ export function removeLine(text: string, lineStart: number, lineEnd: number): st
  */
 export function replaceLine(text: string, lineStart: number, lineEnd: number, line: string, indent = INDENT): string {
   const carriageReturn = text[lineEnd - 1] === '\r' ? '\r' : ''
+  const existing = text.slice(lineStart, lineEnd).replace(/\r$/, '')
+  const existingIndent = /^[ \t]*/.exec(existing)?.[0]
   const masked = maskWithSpans(text).text
   let comment = ''
   for (let index = lineStart; index < lineEnd; index += 1) {
@@ -458,7 +491,7 @@ export function replaceLine(text: string, lineStart: number, lineEnd: number, li
       break
     }
   }
-  return splice(text, lineStart, lineEnd, indent + line + comment + carriageReturn)
+  return splice(text, lineStart, lineEnd, (existingIndent ?? indent) + line + comment + carriageReturn)
 }
 
 /** 声明的键在 dae 词法中必须是裸 ID;这里进一步收窄到无歧义的安全子集。 */
@@ -478,6 +511,69 @@ export function appendToSection(text: string, sectionName: string, lines: string
   const before = text.slice(section.bodyStart, section.bodyEnd)
   const insertion = (before === '' || before.endsWith('\n') ? '' : newline) + block + newline
   return splice(text, section.bodyEnd, section.bodyEnd, insertion)
+}
+
+/** 读取节大括号内的原文，只移除最外层各一个换行，内部缩进与注释不变。 */
+export function readSectionBody(text: string, sectionName: string): string {
+  const section = findSection(text, sectionName)
+  if (!section) return ''
+  let body = text.slice(section.bodyStart, section.bodyEnd)
+  if (body.startsWith('\r\n')) body = body.slice(2)
+  else if (body.startsWith('\n')) body = body.slice(1)
+  if (body.endsWith('\r\n')) body = body.slice(0, -2)
+  else if (body.endsWith('\n')) body = body.slice(0, -1)
+  return body
+}
+
+/**
+ * 替换单个节的正文；节不存在时在文末创建。
+ * 这是用户明确选择“编辑本节原文”后的整节替换，其余顶层节仍逐字节保留。
+ */
+export function setSectionBody(text: string, sectionName: string, body: string): string {
+  const newline = lineEnding(text)
+  let normalized = body.replace(/\r\n|\r|\n/g, newline)
+  if (normalized.startsWith(newline)) normalized = normalized.slice(newline.length)
+  if (normalized.endsWith(newline)) normalized = normalized.slice(0, -newline.length)
+  const replacement = newline + normalized + (normalized === '' ? '' : newline)
+  const section = findSection(text, sectionName)
+  if (section) return splice(text, section.bodyStart, section.bodyEnd, replacement)
+
+  const trailing = text === '' || text.endsWith(newline) ? '' : newline
+  const separation = text === '' || /(?:\r?\n)\s*$/.test(text) ? '' : newline
+  return text + trailing + separation + sectionName + ' {' + replacement + '}' + newline
+}
+
+function routingLine(match: string, outbound: string, isFallback: boolean): string {
+  return isFallback ? `fallback: ${outbound}` : `${match} -> ${outbound}`
+}
+
+/** 新规则默认插在 fallback 之前，避免生成永远匹配不到的规则。 */
+export function addRoutingRule(text: string, match: string, outbound: string, isFallback = false): string {
+  const line = routingLine(match, outbound, isFallback)
+  if (!isFallback) {
+    const fallback = parseRoutingRules(text).find((rule) => rule.isFallback)
+    if (fallback) {
+      const newline = lineEnding(text)
+      return splice(text, fallback.lineStart, fallback.lineStart, INDENT + line + newline)
+    }
+  }
+  return appendToSection(text, 'routing', [line])
+}
+
+export function setRoutingRule(
+  text: string,
+  rule: RoutingRule,
+  match: string,
+  outbound: string,
+  isFallback = rule.isFallback,
+): string {
+  if (!rule.editable) return text
+  return replaceLine(text, rule.lineStart, rule.lineEnd, routingLine(match, outbound, isFallback))
+}
+
+export function removeRoutingRule(text: string, rule: RoutingRule): string {
+  if (!rule.editable) return text
+  return removeLine(text, rule.lineStart, rule.lineEnd)
 }
 
 /** 在 group 节内新建子分组;group 节不存在时先创建。 */

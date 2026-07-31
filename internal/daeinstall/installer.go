@@ -26,6 +26,7 @@ import (
 
 	"github.com/tuoro/kdae-panel/internal/atomicfile"
 	"github.com/tuoro/kdae-panel/internal/dae"
+	"github.com/tuoro/kdae-panel/internal/daediag"
 	"github.com/tuoro/kdae-panel/internal/geodata"
 	"github.com/tuoro/kdae-panel/internal/host"
 	"github.com/tuoro/kdae-panel/internal/upstream"
@@ -106,12 +107,16 @@ type Installer struct {
 	statePath   string
 	backupPath  string
 	serviceName string
+	cache       *versionCache
 	// unitDir 是 systemd 单元的落地目录，留空即用系统默认，测试会覆盖它。
-	unitDir  string
-	fetcher  Fetcher
-	newProbe ProbeFactory
-	service  ServiceController
-	logger   *slog.Logger
+	unitDir string
+	// geoSearchDirs 只供卸载测试把搜索范围收进临时目录；生产环境留空，
+	// 始终使用 dae 的真实 geo 搜索顺序。
+	geoSearchDirs []string
+	fetcher       Fetcher
+	newProbe      ProbeFactory
+	service       ServiceController
+	logger        *slog.Logger
 	// health/interval 是重启后的健康观察窗口与采样间隔，测试会调短它们。
 	health   time.Duration
 	interval time.Duration
@@ -159,6 +164,7 @@ func New(options Options) (*Installer, error) {
 		statePath:   options.StatePath,
 		backupPath:  options.StatePath + ".previous-dae",
 		serviceName: options.ServiceName,
+		cache:       newVersionCache(options.StatePath),
 		fetcher:     options.Fetcher,
 		newProbe:    newProbe,
 		service:     options.Service,
@@ -184,8 +190,59 @@ func resolveBinaryPath(configured string) (string, error) {
 	return filepath.Join("/usr/bin", configured), nil
 }
 
-func (i *Installer) Versions(ctx context.Context, source upstream.Source, limit int) ([]upstream.Version, error) {
-	return i.fetcher.List(ctx, source, limit)
+func (i *Installer) Versions(ctx context.Context, source upstream.Source, limit int) ([]Version, error) {
+	platform, err := upstream.DetectPlatform()
+	if err != nil {
+		return nil, err
+	}
+	cached, cacheErr := i.cache.list(source, platform.Name)
+	if cacheErr != nil {
+		i.logger.Warn("读取 dae 本地版本列表时跳过了无效条目", "error", cacheErr)
+	}
+	remote, upstreamErr := i.fetcher.List(ctx, source, limit)
+	if upstreamErr != nil && len(cached) == 0 {
+		return nil, upstreamErr
+	}
+	if upstreamErr != nil {
+		i.logger.Warn("上游版本列表不可用，仅返回本地版本", "source", source, "error", upstreamErr)
+	}
+
+	versions := make([]Version, 0, len(remote)+len(cached))
+	byRef := make(map[string]int, len(remote))
+	for _, item := range remote {
+		byRef[item.Ref] = len(versions)
+		versions = append(versions, Version{Version: item})
+	}
+	for _, item := range cached {
+		cachedAt := item.CachedAt
+		if index, exists := byRef[item.Ref]; exists {
+			versions[index].Cached = true
+			versions[index].CachedAt = &cachedAt
+			versions[index].CachedBytes = item.Size
+			// 上游产物即使已经过期，本地副本仍可安装。
+			versions[index].Installable = true
+			continue
+		}
+		description := "仅保留在本机"
+		if upstreamErr != nil {
+			description = "上游暂不可用，仅显示本机缓存"
+		}
+		versions = append(versions, Version{
+			Version: upstream.Version{
+				Source:      item.Source,
+				Ref:         item.Ref,
+				Label:       item.Label,
+				Description: description,
+				PublishedAt: item.CachedAt,
+				Installable: true,
+			},
+			Cached:      true,
+			CachedOnly:  true,
+			CachedAt:    &cachedAt,
+			CachedBytes: item.Size,
+		})
+	}
+	return versions, nil
 }
 
 // target 以 systemd 单元实际启动的可执行文件为准。
@@ -288,24 +345,54 @@ func (i *Installer) geoWarnings(ctx context.Context) []string {
 	return nil
 }
 
-// Download 取回并校验指定版本，返回发布包内的全部物料。
-// 这一步耗时最长且不触碰任何共享状态，因此调用方可以在不持有控制锁的情况下先做完。
-func (i *Installer) Download(ctx context.Context, source upstream.Source, ref string) (upstream.Bundle, error) {
+// Acquire 优先读取并重新校验本地版本；requireBundle 为真时仍取完整发布包，
+// 因为首次安装还需要服务单元、种子配置与 geo，而缓存只保留可执行文件。
+func (i *Installer) Acquire(ctx context.Context, source upstream.Source, ref, label string,
+	requireBundle bool) (upstream.Bundle, bool, error) {
 	platform, err := upstream.DetectPlatform()
 	if err != nil {
-		return upstream.Bundle{}, err
+		return upstream.Bundle{}, false, err
+	}
+	if !requireBundle {
+		content, metadata, err := i.cache.load(source, ref, platform.Name)
+		switch {
+		case err == nil:
+			i.logger.Info("使用已校验的 dae 本地版本", "source", source, "ref", ref,
+				"cached_at", metadata.CachedAt, "bytes", len(content))
+			return upstream.Bundle{Binary: content}, true, nil
+		case errors.Is(err, ErrCachedVersionNotFound):
+		case errors.Is(err, errInvalidVersionCache):
+			i.logger.Warn("dae 本地版本已损坏，将重新下载", "source", source, "ref", ref, "error", err)
+			if removeErr := i.cache.discardInvalid(source, ref, platform.Name); removeErr != nil {
+				i.logger.Warn("清理损坏的 dae 本地版本失败", "source", source, "ref", ref, "error", removeErr)
+			}
+		default:
+			return upstream.Bundle{}, false, fmt.Errorf("读取 dae 本地版本: %w", err)
+		}
 	}
 	asset, err := i.fetcher.Resolve(ctx, source, ref, platform)
 	if err != nil {
-		return upstream.Bundle{}, err
+		return upstream.Bundle{}, false, err
 	}
 	bundle, err := i.fetcher.FetchBundle(ctx, asset)
 	if err != nil {
-		return upstream.Bundle{}, err
+		return upstream.Bundle{}, false, err
+	}
+	if err := i.cache.store(source, ref, label, platform.Name, bundle.Binary); err != nil {
+		return upstream.Bundle{}, false, fmt.Errorf("保存 dae 本地版本: %w", err)
 	}
 	i.logger.Info("已取得并校验 dae 发布包",
 		"source", source, "ref", ref, "asset", asset.Filename, "bytes", len(bundle.Binary))
-	return bundle, nil
+	return bundle, false, nil
+}
+
+// DeleteCached 删除指定版本的本地副本，不触碰当前运行文件与事务回滚点。
+func (i *Installer) DeleteCached(source upstream.Source, ref string) error {
+	platform, err := upstream.DetectPlatform()
+	if err != nil {
+		return err
+	}
+	return i.cache.delete(source, ref, platform.Name)
 }
 
 // Install 把已下载的内容装上去。调用方应在持有全局控制锁时调用它。
@@ -537,6 +624,15 @@ func (i *Installer) backupCurrent(target string) (*pendingBackup, error) {
 	// 一并记下旧版本的账本，回滚后才能如实显示回到了哪一版。
 	if state, err := i.readState(); err == nil && state != nil {
 		pending.state, _ = json.Marshal(state)
+		// 只有账本摘要与当前文件一致时才能用该账本给缓存命名；否则它可能是
+		// 面板外替换的未知二进制，绝不能冒充已知版本。
+		if state.Source != "" && state.Ref != "" && state.SHA256 != "" && state.SHA256 == digestBytes(current) {
+			if platform, err := upstream.DetectPlatform(); err == nil {
+				if err := i.cache.store(state.Source, state.Ref, state.Label, platform.Name, current); err != nil {
+					i.logger.Warn("保留当前 dae 本地版本失败", "source", state.Source, "ref", state.Ref, "error", err)
+				}
+			}
+		}
 	}
 	return pending, nil
 }
@@ -602,10 +698,11 @@ func (i *Installer) restorePrevious(ctx context.Context, target string) restoreO
 // restart 重启服务并在一个观察窗口内反复确认它稳住了。
 // 替换二进制后必须整体重启：dae 的 eBPF 程序要重新挂载，reload 不足以生效。
 func (i *Installer) restart(ctx context.Context) error {
+	startedAt := time.Now().UTC()
 	restartCtx, cancel := context.WithTimeout(ctx, restartTimeout)
 	defer cancel()
 	if err := i.service.Action(restartCtx, host.ActionRestart); err != nil {
-		return err
+		return i.explainRestartFailure(ctx, startedAt, err)
 	}
 
 	deadline := time.Now().Add(i.health)
@@ -615,30 +712,53 @@ func (i *Installer) restart(ctx context.Context) error {
 		select {
 		case <-time.After(i.interval):
 		case <-restartCtx.Done():
-			return restartCtx.Err()
+			return i.explainRestartFailure(ctx, startedAt, restartCtx.Err())
 		}
 		status, err := i.service.Status(restartCtx)
 		if err != nil {
-			return fmt.Errorf("重启后无法读取服务状态: %w", err)
+			return i.explainRestartFailure(ctx, startedAt, fmt.Errorf("重启后无法读取服务状态: %w", err))
 		}
 		// 崩溃重启循环里 ActiveState 会在 activating/failed 之间跳，
 		// 任何一次不是 active 都判定失败，而不是等到窗口结束再看最后一眼。
 		if status.ActiveState != "active" {
-			return fmt.Errorf("重启后服务状态为 %s/%s", status.ActiveState, status.SubState)
+			return i.explainRestartFailure(ctx, startedAt,
+				fmt.Errorf("重启后服务状态为 %s/%s", status.ActiveState, status.SubState))
 		}
 		// 只看 ActiveState 会漏掉采样间隔内跑完的崩溃-重启循环：
 		// 两次采样都是 active，中间其实已经挂掉并被 systemd 拉起来过。
 		// NRestarts 单调递增，正好把这种"看不见的崩溃"暴露出来。
 		if !sampled {
 			baseline, sampled = status.Restarts, true
+			// 第一次采样只建立基线，不能因为调度延迟已经越过 deadline 就直接成功。
+			// 至少再采一次，才能判断观察期间有没有发生崩溃重启。
+			continue
 		} else if status.Restarts > baseline {
-			return fmt.Errorf("重启后服务在观察窗口内又重启了 %d 次，新版本很可能起不稳",
-				status.Restarts-baseline)
+			return i.explainRestartFailure(ctx, startedAt,
+				fmt.Errorf("重启后服务在观察窗口内又重启了 %d 次，新版本很可能起不稳",
+					status.Restarts-baseline))
 		}
 		if !time.Now().Before(deadline) {
 			return nil
 		}
 	}
+}
+
+type serviceLogReader interface {
+	Logs(context.Context, int) ([]host.LogEntry, error)
+}
+
+func (i *Installer) explainRestartFailure(ctx context.Context, startedAt time.Time, cause error) error {
+	reader, ok := i.service.(serviceLogReader)
+	if !ok {
+		return cause
+	}
+	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	entries, err := reader.Logs(logCtx, 80)
+	if err != nil {
+		return cause
+	}
+	return daediag.ExplainGeoFailure(cause, entries, startedAt)
 }
 
 func (i *Installer) previousStatePath() string {

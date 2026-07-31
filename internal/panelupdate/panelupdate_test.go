@@ -82,6 +82,7 @@ func newTestManager(t *testing.T, fetcher *fakeFetcher, service *fakeService) (*
 		Version:    "v0.1.0",
 		BinaryPath: binaryPath,
 		BackupPath: filepath.Join(directory, "state", "kdae-panel.previous"),
+		Enabled:    true,
 		Fetcher:    fetcher,
 		Service:    service,
 		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -98,6 +99,84 @@ func newTestManager(t *testing.T, fetcher *fakeFetcher, service *fakeService) (*
 		return strings.TrimPrefix(string(content), elfMagic), nil
 	}
 	return manager, binaryPath
+}
+
+func TestPreferencePersistsAcrossManagerRestart(t *testing.T) {
+	manager, binaryPath := newTestManager(t, &fakeFetcher{}, &fakeService{})
+	if err := os.MkdirAll(filepath.Dir(manager.backupPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(manager.backupPath, elfBytes("previous"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.SetEnabled(false); err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(context.Background()); status.Enabled || status.Updatable || status.PreviousPath != manager.backupPath {
+		t.Fatalf("关闭后的状态 = %+v", status)
+	}
+
+	reloaded, err := New(Options{
+		Version:        "v0.1.0",
+		BinaryPath:     binaryPath,
+		BackupPath:     manager.backupPath,
+		PreferencePath: manager.preferencePath,
+		Enabled:        true,
+		Fetcher:        &fakeFetcher{},
+		Service:        &fakeService{},
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := reloaded.Status(context.Background()); status.Enabled || status.Updatable || status.PreviousPath != manager.backupPath {
+		t.Fatalf("重启后没有保持关闭状态: %+v", status)
+	}
+	if err := reloaded.SetEnabled(true); err != nil {
+		t.Fatal(err)
+	}
+	if status := reloaded.Status(context.Background()); !status.Enabled || !status.Updatable {
+		t.Fatalf("重新开启后的状态 = %+v", status)
+	}
+}
+
+func TestBrokenPreferenceFallsBackToDeploymentDefault(t *testing.T) {
+	directory := t.TempDir()
+	preferencePath := filepath.Join(directory, "self-update.json")
+	if err := os.WriteFile(preferencePath, []byte(`{"enabled":`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	binaryPath := filepath.Join(directory, "kdae-panel")
+	if err := os.WriteFile(binaryPath, elfBytes("old"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(Options{
+		Version:        "v0.1.0",
+		BinaryPath:     binaryPath,
+		BackupPath:     filepath.Join(directory, "kdae-panel.previous"),
+		PreferencePath: preferencePath,
+		Enabled:        true,
+		Fetcher:        &fakeFetcher{},
+		Service:        &fakeService{},
+		Logger:         slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status := manager.Status(context.Background()); !status.Enabled || !status.Updatable {
+		t.Fatalf("损坏偏好不应覆盖部署默认值: %+v", status)
+	}
+}
+
+func TestPreferenceWriteFailureDoesNotChangeMemoryState(t *testing.T) {
+	manager, _ := newTestManager(t, &fakeFetcher{}, &fakeService{})
+	manager.preferencePath = t.TempDir() // 目录不能被原子文件替换。
+	if err := manager.SetEnabled(false); err == nil {
+		t.Fatal("偏好写入失败时应返回错误")
+	}
+	if status := manager.Status(context.Background()); !status.Enabled || !status.Updatable {
+		t.Fatalf("持久化失败后不应改变内存状态: %+v", status)
+	}
 }
 
 // 等待 Apply 里那个延后发出的重启请求。

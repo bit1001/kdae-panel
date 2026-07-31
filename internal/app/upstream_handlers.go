@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -16,17 +17,24 @@ import (
 type InstallService interface {
 	Status(ctx context.Context) daeinstall.Status
 	Provision(ctx context.Context) daeinstall.Provision
-	Versions(ctx context.Context, source upstream.Source, limit int) ([]upstream.Version, error)
-	Download(ctx context.Context, source upstream.Source, ref string) (upstream.Bundle, error)
+	Versions(ctx context.Context, source upstream.Source, limit int) ([]daeinstall.Version, error)
+	Acquire(ctx context.Context, source upstream.Source, ref, label string, requireBundle bool) (upstream.Bundle, bool, error)
+	DeleteCached(source upstream.Source, ref string) error
 	Install(ctx context.Context, binary []byte, source upstream.Source, ref, label string) (daeinstall.Status, error)
 	FirstInstall(ctx context.Context, bundle upstream.Bundle, source upstream.Source, ref, label string) (daeinstall.Status, error)
 	Rollback(ctx context.Context) (daeinstall.Status, error)
+	Uninstall(ctx context.Context, options daeinstall.UninstallOptions) error
 }
 
 type installRequest struct {
 	Source string `json:"source"`
 	Ref    string `json:"ref"`
 	Label  string `json:"label,omitempty"`
+}
+
+type cacheRequest struct {
+	Source string `json:"source"`
+	Ref    string `json:"ref"`
 }
 
 // JobPhase 描述安装任务当前进行到哪一步。
@@ -50,6 +58,7 @@ type Job struct {
 	Source    string     `json:"source,omitempty"`
 	Ref       string     `json:"ref,omitempty"`
 	Label     string     `json:"label,omitempty"`
+	Cached    bool       `json:"cached,omitempty"`
 	StartedAt *time.Time `json:"startedAt,omitempty"`
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 	Error     string     `json:"error,omitempty"`
@@ -83,6 +92,12 @@ func (j *installJobs) advance(phase JobPhase) {
 	j.job.Phase = phase
 }
 
+func (j *installJobs) markCached(cached bool) {
+	j.mu.Lock()
+	defer j.mu.Unlock()
+	j.job.Cached = cached
+}
+
 func (j *installJobs) finish(err error) {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -108,6 +123,7 @@ func registerUpstreamRoutes(router *http.ServeMux, service InstallService, opera
 		for _, pattern := range []string{
 			"GET /api/v1/dae/install", "POST /api/v1/dae/install",
 			"GET /api/v1/dae/versions", "POST /api/v1/dae/rollback",
+			"DELETE /api/v1/dae/cache", "POST /api/v1/dae/uninstall",
 		} {
 			router.HandleFunc(pattern, unavailable)
 		}
@@ -174,12 +190,51 @@ func registerUpstreamRoutes(router *http.ServeMux, service InstallService, opera
 		writeJSON(writer, http.StatusAccepted, map[string]any{"job": jobs.snapshot()})
 	})
 
+	router.HandleFunc("DELETE /api/v1/dae/cache", func(writer http.ResponseWriter, request *http.Request) {
+		var payload cacheRequest
+		if !decodeSmallJSONBody(writer, request, &payload) {
+			return
+		}
+		source, err := upstream.ParseSource(payload.Source)
+		if err != nil {
+			writeAPIError(writer, http.StatusBadRequest, "invalid_upstream_source", err.Error())
+			return
+		}
+		if payload.Ref == "" {
+			writeAPIError(writer, http.StatusBadRequest, "invalid_version", "必须指定要删除的本地版本")
+			return
+		}
+		if err := service.DeleteCached(source, payload.Ref); err != nil {
+			if errors.Is(err, daeinstall.ErrCachedVersionNotFound) {
+				writeAPIError(writer, http.StatusNotFound, "cached_version_not_found", err.Error())
+				return
+			}
+			writeAPIError(writer, http.StatusInternalServerError, "cache_delete_failed", err.Error())
+			return
+		}
+		writer.WriteHeader(http.StatusNoContent)
+	})
+
 	router.HandleFunc("POST /api/v1/dae/rollback", func(writer http.ResponseWriter, request *http.Request) {
 		if !jobs.begin(PhaseApplying, "", "", "回滚") {
 			writeAPIError(writer, http.StatusConflict, "install_in_progress", "已有安装任务正在执行")
 			return
 		}
 		go runRollback(jobs, service, operations, logger)
+		writeJSON(writer, http.StatusAccepted, map[string]any{"job": jobs.snapshot()})
+	})
+
+	router.HandleFunc("POST /api/v1/dae/uninstall", func(writer http.ResponseWriter, request *http.Request) {
+		var options daeinstall.UninstallOptions
+		// 无请求体等同于安全零值，兼容旧客户端；有请求体仍只接受一个小 JSON 对象。
+		if !decodeOptionalJSONBody(writer, request, &options) {
+			return
+		}
+		if !jobs.begin(PhaseApplying, "", "", "卸载 dae") {
+			writeAPIError(writer, http.StatusConflict, "install_in_progress", "已有版本管理任务正在执行")
+			return
+		}
+		go runUninstall(jobs, service, operations, logger, options)
 		writeJSON(writer, http.StatusAccepted, map[string]any{"job": jobs.snapshot()})
 	})
 }
@@ -193,14 +248,16 @@ func runInstall(jobs *installJobs, service InstallService, operations *sync.Mute
 	defer cancel()
 
 	logger.Info("开始安装 dae 版本", "source", source, "ref", ref)
-	// 下载与校验不触碰任何共享状态，因此不占控制锁：
-	// 几十兆的下载不该把配置保存和订阅定时刷新一起堵住。
-	bundle, err := service.Download(ctx, source, ref)
+	// 首次安装需要完整发布包；已有 dae 时只需二进制，可以直接命中本地缓存。
+	// 读取缓存或下载都不占控制锁，几十兆 I/O 不该堵住配置保存与订阅刷新。
+	requireBundle := !service.Status(ctx).Ready
+	bundle, cached, err := service.Acquire(ctx, source, ref, label, requireBundle)
 	if err != nil {
 		logger.Warn("下载 dae 版本失败", "source", source, "ref", ref, "error", err)
 		jobs.finish(err)
 		return
 	}
+	jobs.markCached(cached)
 
 	jobs.advance(PhaseApplying)
 	operations.Lock()
@@ -208,6 +265,10 @@ func runInstall(jobs *installJobs, service InstallService, operations *sync.Mute
 	// 已有 dae 就替换二进制；还没有就连同单元、种子配置与 geo 数据一起装。
 	install := service.Install
 	if !service.Status(ctx).Ready {
+		if len(bundle.Unit) == 0 {
+			jobs.finish(errors.New("读取本地版本后发现 dae 已被外部卸载；首次安装需要完整发布包，请重试"))
+			return
+		}
 		install = func(ctx context.Context, _ []byte, source upstream.Source, ref, label string) (daeinstall.Status, error) {
 			return service.FirstInstall(ctx, bundle, source, ref, label)
 		}
@@ -233,5 +294,21 @@ func runRollback(jobs *installJobs, service InstallService, operations *sync.Mut
 		return
 	}
 	logger.Info("已回滚 dae 版本")
+	jobs.finish(nil)
+}
+
+func runUninstall(jobs *installJobs, service InstallService, operations *sync.Mutex, logger *slog.Logger,
+	options daeinstall.UninstallOptions) {
+	ctx, cancel := context.WithTimeout(context.Background(), installTimeout)
+	defer cancel()
+
+	operations.Lock()
+	defer operations.Unlock()
+	if err := service.Uninstall(ctx, options); err != nil {
+		logger.Warn("卸载 dae 失败", "error", err)
+		jobs.finish(err)
+		return
+	}
+	logger.Info("已卸载 dae", "purge_config", options.PurgeConfig, "purge_geo", options.PurgeGeo)
 	jobs.finish(nil)
 }

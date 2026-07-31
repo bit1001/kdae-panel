@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -12,6 +13,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -84,9 +86,12 @@ func (s stubDaeService) Sysdump(_ context.Context) (dae.Sysdump, error) {
 }
 
 type stubHostService struct {
-	status  host.Status
-	actions []host.Action
-	err     error
+	status     host.Status
+	interfaces []host.NetworkInterface
+	actions    []host.Action
+	err        error
+	logs       []host.LogEntry
+	logsErr    error
 }
 
 type stubAuthenticationService struct {
@@ -134,7 +139,11 @@ func (s *stubHostService) Action(_ context.Context, action host.Action) error {
 }
 
 func (s *stubHostService) Logs(_ context.Context, _ int) ([]host.LogEntry, error) {
-	return []host.LogEntry{}, s.err
+	return append([]host.LogEntry(nil), s.logs...), s.logsErr
+}
+
+func (s *stubHostService) Interfaces(_ context.Context) ([]host.NetworkInterface, error) {
+	return s.interfaces, s.err
 }
 
 func TestHealth(t *testing.T) {
@@ -277,6 +286,93 @@ func TestServiceRestartAction(t *testing.T) {
 	}
 	if len(hostService.actions) != 1 || hostService.actions[0] != host.ActionRestart {
 		t.Fatalf("服务动作异常: %v", hostService.actions)
+	}
+}
+
+func TestServiceStartFailureExplainsMissingGeoClassification(t *testing.T) {
+	hostService := &stubHostService{
+		err:  errors.New("执行 systemd start 失败"),
+		logs: []host.LogEntry{{Message: "country code twitter not found in /etc/dae/geoip.dat"}},
+	}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Host: hostService},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder,
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/start", nil))
+	if recorder.Code != http.StatusBadGateway || !strings.Contains(recorder.Body.String(), "geoip:twitter") {
+		t.Fatalf("启动失败应指出 Geo 分类：%d %s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHostInterfaces(t *testing.T) {
+	want := []host.NetworkInterface{
+		{Name: "dae0", Addresses: []string{"10.0.0.1/24"}},
+		{Name: "ens2", Addresses: []string{"192.168.50.23/24", "fe80::1/64"}},
+		{Name: "lo", Addresses: []string{"127.0.0.1/8", "::1/128"}},
+	}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Host: &stubHostService{interfaces: want}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/host/interfaces", nil)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("状态码 = %d，响应 = %s", recorder.Code, recorder.Body.String())
+	}
+	var got []host.NetworkInterface
+	if err := json.NewDecoder(recorder.Body).Decode(&got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("接口列表 = %+v，期望 %+v", got, want)
+	}
+}
+
+func TestHostInterfacesReportEnumerationFailure(t *testing.T) {
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Host: &stubHostService{err: errors.New("枚举失败")}},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/host/interfaces", nil)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "host_interfaces_unavailable") {
+		t.Fatalf("响应异常: status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+}
+
+func TestHostInterfacesRequireHostService(t *testing.T) {
+	application, err := NewWithDae(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		stubDaeService{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/host/interfaces", nil)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusServiceUnavailable || !strings.Contains(recorder.Body.String(), "host_service_unavailable") {
+		t.Fatalf("响应异常: status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -496,8 +592,9 @@ func TestScheduleRunnerWiredWithOperationsLock(t *testing.T) {
 type stubInstallService struct {
 	status   daeinstall.Status
 	plan     daeinstall.Provision
-	versions []upstream.Version
+	versions []daeinstall.Version
 	binary   []byte
+	cached   bool
 	err      error
 	release  chan struct{}
 	// 安装在后台 goroutine 里执行，测试主协程会同时读取记录，必须加锁。
@@ -521,7 +618,7 @@ func (s *stubInstallService) Status(context.Context) daeinstall.Status {
 	return s.status
 }
 
-func (s *stubInstallService) Versions(_ context.Context, source upstream.Source, _ int) ([]upstream.Version, error) {
+func (s *stubInstallService) Versions(_ context.Context, source upstream.Source, _ int) ([]daeinstall.Version, error) {
 	return s.versions, s.err
 }
 
@@ -529,11 +626,20 @@ func (s *stubInstallService) Provision(context.Context) daeinstall.Provision {
 	return s.plan
 }
 
-func (s *stubInstallService) Download(context.Context, upstream.Source, string) (upstream.Bundle, error) {
+func (s *stubInstallService) Acquire(_ context.Context, _ upstream.Source, _, _ string, requireBundle bool) (upstream.Bundle, bool, error) {
 	if s.release != nil {
 		<-s.release
 	}
-	return upstream.Bundle{Binary: s.binary}, s.err
+	bundle := upstream.Bundle{Binary: s.binary}
+	if requireBundle {
+		bundle.Unit = []byte("dae.service")
+	}
+	return bundle, s.cached, s.err
+}
+
+func (s *stubInstallService) DeleteCached(source upstream.Source, ref string) error {
+	s.record("delete-cache:" + string(source) + ":" + ref)
+	return s.err
 }
 
 func (s *stubInstallService) FirstInstall(_ context.Context, _ upstream.Bundle, source upstream.Source, ref, _ string) (daeinstall.Status, error) {
@@ -549,6 +655,11 @@ func (s *stubInstallService) Install(_ context.Context, _ []byte, source upstrea
 func (s *stubInstallService) Rollback(context.Context) (daeinstall.Status, error) {
 	s.record("rollback")
 	return s.status, s.err
+}
+
+func (s *stubInstallService) Uninstall(_ context.Context, options daeinstall.UninstallOptions) error {
+	s.record(fmt.Sprintf("uninstall:%t:%t", options.PurgeConfig, options.PurgeGeo))
+	return s.err
 }
 
 func newInstallApp(t *testing.T, service InstallService) *App {
@@ -571,7 +682,9 @@ func TestDaeInstallDisabledByDefault(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/api/v1/dae/install", nil),
 		httptest.NewRequest(http.MethodGet, "/api/v1/dae/versions?source=official", nil),
 		httptest.NewRequest(http.MethodPost, "/api/v1/dae/install", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)),
+		httptest.NewRequest(http.MethodDelete, "/api/v1/dae/cache", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)),
 		httptest.NewRequest(http.MethodPost, "/api/v1/dae/rollback", nil),
+		httptest.NewRequest(http.MethodPost, "/api/v1/dae/uninstall", nil),
 	} {
 		recorder := httptest.NewRecorder()
 		application.Handler().ServeHTTP(recorder, request)
@@ -597,7 +710,7 @@ func TestDaeVersionsRejectsUnknownSource(t *testing.T) {
 
 func TestDaeInstallRunsAsynchronously(t *testing.T) {
 	// Ready 表示机器上已有 dae，因此走替换而不是首次安装
-	service := &stubInstallService{binary: []byte("v2"), status: daeinstall.Status{Ready: true}}
+	service := &stubInstallService{binary: []byte("v2"), cached: true, status: daeinstall.Status{Ready: true}}
 	application := newInstallApp(t, service)
 
 	recorder := httptest.NewRecorder()
@@ -617,6 +730,36 @@ func TestDaeInstallRunsAsynchronously(t *testing.T) {
 	}
 	if installed := service.records(); len(installed) != 1 || installed[0] != "kdae:30187784287" {
 		t.Fatalf("安装调用 = %v", installed)
+	}
+	if job := awaitJobSettled(t, application); !job.Cached {
+		t.Fatalf("缓存命中应写进任务状态: %+v", job)
+	}
+}
+
+func TestDaeCachedVersionCanBeDeleted(t *testing.T) {
+	service := &stubInstallService{}
+	application := newInstallApp(t, service)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/dae/cache",
+		strings.NewReader(`{"source":"official","ref":"v2.0.0"}`))
+	application.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNoContent {
+		t.Fatalf("状态码 = %d，期望 204，响应 = %s", recorder.Code, recorder.Body.String())
+	}
+	if records := service.records(); len(records) != 1 || records[0] != "delete-cache:official:v2.0.0" {
+		t.Fatalf("删除缓存调用 = %v", records)
+	}
+}
+
+func TestDaeCachedVersionDeleteReportsMissing(t *testing.T) {
+	service := &stubInstallService{err: daeinstall.ErrCachedVersionNotFound}
+	application := newInstallApp(t, service)
+	recorder := httptest.NewRecorder()
+	request := httptest.NewRequest(http.MethodDelete, "/api/v1/dae/cache",
+		strings.NewReader(`{"source":"kdae","ref":"30187784287"}`))
+	application.Handler().ServeHTTP(recorder, request)
+	if recorder.Code != http.StatusNotFound || !strings.Contains(recorder.Body.String(), "cached_version_not_found") {
+		t.Fatalf("不存在的缓存响应 = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -760,6 +903,52 @@ func TestDaeRollbackReportsFailure(t *testing.T) {
 	}
 }
 
+func TestDaeUninstallRunsAsynchronously(t *testing.T) {
+	service := &stubInstallService{status: daeinstall.Status{Ready: true}}
+	application := newInstallApp(t, service)
+
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/dae/uninstall", nil))
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("状态码 = %d，期望 202，响应 = %s", recorder.Code, recorder.Body.String())
+	}
+
+	if job := awaitJobSettled(t, application); job.Phase != PhaseDone || job.Label != "卸载 dae" {
+		t.Fatalf("卸载任务应完成: %+v", job)
+	}
+	if records := service.records(); len(records) != 1 || records[0] != "uninstall:false:false" {
+		t.Fatalf("卸载调用 = %v", records)
+	}
+}
+
+func TestDaeUninstallPassesExplicitDataChoice(t *testing.T) {
+	service := &stubInstallService{status: daeinstall.Status{Ready: true}}
+	application := newInstallApp(t, service)
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v1/dae/uninstall",
+		strings.NewReader(`{"purgeConfig":true,"purgeGeo":true}`))
+	application.Handler().ServeHTTP(httptest.NewRecorder(), request)
+	if job := awaitJobSettled(t, application); job.Phase != PhaseDone {
+		t.Fatalf("卸载任务应完成: %+v", job)
+	}
+	if records := service.records(); len(records) != 1 || records[0] != "uninstall:true:true" {
+		t.Fatalf("卸载选项没有透传: %v", records)
+	}
+}
+
+func TestDaeUninstallReportsFailure(t *testing.T) {
+	service := &stubInstallService{status: daeinstall.Status{Ready: true}, err: errors.New("当前 dae 没有面板安装记录")}
+	application := newInstallApp(t, service)
+
+	application.Handler().ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/api/v1/dae/uninstall", nil))
+
+	job := awaitJobSettled(t, application)
+	if job.Phase != PhaseFailed || !strings.Contains(job.Error, "没有面板安装记录") {
+		t.Fatalf("卸载失败应如实上报: %+v", job)
+	}
+}
+
 // awaitJobSettled 轮询状态端点直到任务不再进行中。
 func awaitJobSettled(t *testing.T, application *App) Job {
 	t.Helper()
@@ -835,6 +1024,22 @@ func fetchPanelUpdate(t *testing.T, application *App) map[string]any {
 	return payload.Check
 }
 
+func forcePanelUpdateCheck(t *testing.T, application *App) map[string]any {
+	t.Helper()
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/panel/update/check", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("强制检查状态码 = %d，响应 = %s", recorder.Code, recorder.Body.String())
+	}
+	var payload struct {
+		Check map[string]any `json:"check"`
+	}
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload.Check
+}
+
 type stubPanelUpdateService struct {
 	status    panelupdate.Status
 	mu        sync.Mutex
@@ -844,6 +1049,17 @@ type stubPanelUpdateService struct {
 }
 
 func (s *stubPanelUpdateService) Status(context.Context) panelupdate.Status { return s.status }
+
+func (s *stubPanelUpdateService) SetEnabled(enabled bool) error {
+	if s.err != nil {
+		return s.err
+	}
+	s.mu.Lock()
+	s.status.Enabled = enabled
+	s.status.Updatable = enabled
+	s.mu.Unlock()
+	return nil
+}
 
 func (s *stubPanelUpdateService) Download(_ context.Context, version string) (upstream.PanelBinary, error) {
 	s.mu.Lock()
@@ -868,17 +1084,46 @@ func (s *stubPanelUpdateService) applyCount() int {
 	return s.applied
 }
 
-// 未启用自升级时必须返回可读的 panel_self_update_disabled：
-// 前端据此不显示升级按钮，落到 api_not_found 会被当成版本不匹配。
-func TestPanelSelfUpdateDisabledByDefault(t *testing.T) {
+// 没有升级服务的非正式嵌入部署要返回明确错误，不能落到 api_not_found。
+func TestPanelSelfUpdateUnavailable(t *testing.T) {
 	application := newUpdateCheckApp(t, "v0.1.0", nil)
 	recorder := httptest.NewRecorder()
 	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v1/panel/update", nil))
 	if recorder.Code != http.StatusServiceUnavailable {
 		t.Fatalf("状态码 = %d，期望 503", recorder.Code)
 	}
-	if !strings.Contains(recorder.Body.String(), "panel_self_update_disabled") {
-		t.Fatalf("响应应说明功能未启用: %s", recorder.Body.String())
+	if !strings.Contains(recorder.Body.String(), "panel_self_update_unavailable") {
+		t.Fatalf("响应应说明部署不支持: %s", recorder.Body.String())
+	}
+}
+
+func TestPanelSelfUpdatePreferenceCanBeChangedFromAPI(t *testing.T) {
+	service := &stubPanelUpdateService{status: panelupdate.Status{Enabled: false}}
+	application := newSelfUpdateApp(t, service)
+
+	preference := httptest.NewRecorder()
+	application.Handler().ServeHTTP(preference, httptest.NewRequest(http.MethodPut,
+		"/api/v1/panel/update/preference", strings.NewReader(`{"enabled":true}`)))
+	if preference.Code != http.StatusOK || !strings.Contains(preference.Body.String(), `"enabled":true`) {
+		t.Fatalf("开启响应 = %d %s", preference.Code, preference.Body.String())
+	}
+
+	upgrade := httptest.NewRecorder()
+	application.Handler().ServeHTTP(upgrade, httptest.NewRequest(http.MethodPost,
+		"/api/v1/panel/update", strings.NewReader(`{"version":"v0.2.0"}`)))
+	if upgrade.Code != http.StatusAccepted {
+		t.Fatalf("界面开启后应能升级: %d %s", upgrade.Code, upgrade.Body.String())
+	}
+}
+
+func TestPanelSelfUpdateRejectsWhilePreferenceDisabled(t *testing.T) {
+	service := &stubPanelUpdateService{status: panelupdate.Status{Enabled: false}}
+	application := newSelfUpdateApp(t, service)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
+		"/api/v1/panel/update", strings.NewReader(`{"version":"v0.2.0"}`)))
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "panel_self_update_disabled") {
+		t.Fatalf("关闭状态响应 = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -896,7 +1141,7 @@ func newSelfUpdateApp(t *testing.T, service PanelUpdateService) *App {
 }
 
 func TestPanelSelfUpdateRunsAsynchronously(t *testing.T) {
-	service := &stubPanelUpdateService{status: panelupdate.Status{Updatable: true}}
+	service := &stubPanelUpdateService{status: panelupdate.Status{Enabled: true, Updatable: true}}
 	application := newSelfUpdateApp(t, service)
 
 	recorder := httptest.NewRecorder()
@@ -925,6 +1170,7 @@ func TestPanelSelfUpdateRunsAsynchronously(t *testing.T) {
 // 目录不可写等情形要在启动任务前就挡住，并把原因如实带出。
 func TestPanelSelfUpdateRejectsWhenNotUpdatable(t *testing.T) {
 	service := &stubPanelUpdateService{status: panelupdate.Status{
+		Enabled:   true,
 		Updatable: false,
 		Problem:   "面板无法写入 /usr/bin：只读文件系统",
 	}}
@@ -945,7 +1191,7 @@ func TestPanelSelfUpdateRejectsWhenNotUpdatable(t *testing.T) {
 
 // 版本号会被拼进下载地址，含斜杠或空白的取值必须在拼接前拦住。
 func TestPanelSelfUpdateRejectsMalformedVersion(t *testing.T) {
-	service := &stubPanelUpdateService{status: panelupdate.Status{Updatable: true}}
+	service := &stubPanelUpdateService{status: panelupdate.Status{Enabled: true, Updatable: true}}
 	application := newSelfUpdateApp(t, service)
 
 	for _, bad := range []string{`{"version":"../../etc"}`, `{"version":"v1 0"}`, `{"version":"1.0.0"}`} {
@@ -977,6 +1223,29 @@ func TestPanelUpdateCheck(t *testing.T) {
 	fetchPanelUpdate(t, application)
 	if calls.Load() != 1 {
 		t.Fatalf("检查函数被调用 %d 次，期望缓存后只有 1 次", calls.Load())
+	}
+}
+
+func TestPanelUpdateManualCheckBypassesCache(t *testing.T) {
+	var calls atomic.Int64
+	application := newUpdateCheckApp(t, "v0.1.2", func(context.Context) (string, error) {
+		if calls.Add(1) == 1 {
+			return "v0.2.0", nil
+		}
+		return "v0.3.0", nil
+	})
+
+	first := fetchPanelUpdate(t, application)
+	if first["latest"] != "v0.2.0" {
+		t.Fatalf("初次检查版本 = %v", first["latest"])
+	}
+	manual := forcePanelUpdateCheck(t, application)
+	if manual["latest"] != "v0.3.0" || manual["updateAvailable"] != true {
+		t.Fatalf("手动检查未绕过缓存: %v", manual)
+	}
+	forcePanelUpdateCheck(t, application)
+	if calls.Load() != 2 {
+		t.Fatalf("冷却期内重复检查调用了 %d 次，期望 2 次", calls.Load())
 	}
 }
 
@@ -1033,6 +1302,7 @@ type stubGeoService struct {
 	mu        sync.Mutex
 	applied   int
 	requested upstream.GeoSource
+	custom    []upstream.CustomGeoSource
 }
 
 func (s *stubGeoService) Status(context.Context) geodata.Status { return s.status }
@@ -1067,6 +1337,47 @@ func (s *stubGeoService) applyCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.applied
+}
+
+func (s *stubGeoService) CustomSources() []upstream.CustomGeoSource {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]upstream.CustomGeoSource(nil), s.custom...)
+}
+
+func (s *stubGeoService) CreateCustomSource(source upstream.CustomGeoSource) (upstream.CustomGeoSource, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	source.ID = "0123456789abcdef"
+	source.Source = "custom:" + upstream.GeoSource(source.ID)
+	s.custom = append(s.custom, source)
+	return source, nil
+}
+
+func (s *stubGeoService) UpdateCustomSource(id string, source upstream.CustomGeoSource) (upstream.CustomGeoSource, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.custom {
+		if s.custom[index].ID == id {
+			source.ID = id
+			source.Source = upstream.GeoSource("custom:" + id)
+			s.custom[index] = source
+			return source, nil
+		}
+	}
+	return upstream.CustomGeoSource{}, upstream.ErrCustomGeoSourceNotFound
+}
+
+func (s *stubGeoService) DeleteCustomSource(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for index := range s.custom {
+		if s.custom[index].ID == id {
+			s.custom = append(s.custom[:index], s.custom[index+1:]...)
+			return nil
+		}
+	}
+	return upstream.ErrCustomGeoSourceNotFound
 }
 
 func newGeoApp(t *testing.T, service GeoService) *App {
@@ -1304,6 +1615,64 @@ func TestGeoUpdateRejectsUnknownSource(t *testing.T) {
 	}
 	if service.requestedSource() != "" {
 		t.Fatal("来源非法时不该发起任何下载")
+	}
+}
+
+func TestGeoCustomSourceCRUD(t *testing.T) {
+	service := &stubGeoService{status: geodata.Status{Updatable: true}}
+	application := newGeoApp(t, service)
+	body := `{"label":"自建规则","geoipUrl":"https://example.com/geoip.dat",` +
+		`"geoipSha256Url":"https://example.com/geoip.dat.sha256sum",` +
+		`"geositeUrl":"https://example.com/geosite.dat",` +
+		`"geositeSha256Url":"https://example.com/geosite.dat.sha256sum"}`
+
+	create := httptest.NewRecorder()
+	application.Handler().ServeHTTP(create, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/geo/sources", strings.NewReader(body)))
+	if create.Code != http.StatusCreated || !strings.Contains(create.Body.String(), "custom:0123456789abcdef") {
+		t.Fatalf("创建来源失败：%d %s", create.Code, create.Body.String())
+	}
+
+	update := httptest.NewRecorder()
+	application.Handler().ServeHTTP(update, httptest.NewRequest(http.MethodPut,
+		"/api/v1/dae/geo/sources/0123456789abcdef",
+		strings.NewReader(strings.Replace(body, "自建规则", "更新后的规则", 1))))
+	if update.Code != http.StatusOK || !strings.Contains(update.Body.String(), "更新后的规则") {
+		t.Fatalf("修改来源失败：%d %s", update.Code, update.Body.String())
+	}
+
+	list := httptest.NewRecorder()
+	application.Handler().ServeHTTP(list, httptest.NewRequest(http.MethodGet, "/api/v1/dae/geo/sources", nil))
+	if list.Code != http.StatusOK || !strings.Contains(list.Body.String(), "更新后的规则") {
+		t.Fatalf("来源列表异常：%d %s", list.Code, list.Body.String())
+	}
+
+	remove := httptest.NewRecorder()
+	application.Handler().ServeHTTP(remove, httptest.NewRequest(http.MethodDelete,
+		"/api/v1/dae/geo/sources/0123456789abcdef", nil))
+	if remove.Code != http.StatusNoContent {
+		t.Fatalf("删除来源失败：%d %s", remove.Code, remove.Body.String())
+	}
+
+	empty := httptest.NewRecorder()
+	application.Handler().ServeHTTP(empty, httptest.NewRequest(http.MethodGet, "/api/v1/dae/geo/sources", nil))
+	if empty.Code != http.StatusOK || !strings.Contains(empty.Body.String(), `"sources":[]`) {
+		t.Fatalf("空来源列表必须编码成数组：%d %s", empty.Code, empty.Body.String())
+	}
+}
+
+func TestGeoCustomSourceInUseCannotBeDeleted(t *testing.T) {
+	const id = "0123456789abcdef"
+	service := &stubGeoService{
+		status: geodata.Status{Managed: &geodata.State{Source: upstream.GeoSource("custom:" + id)}},
+		custom: []upstream.CustomGeoSource{{ID: id, Source: upstream.GeoSource("custom:" + id), Label: "使用中"}},
+	}
+	application := newGeoApp(t, service)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodDelete,
+		"/api/v1/dae/geo/sources/"+id, nil))
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "geo_source_in_use") {
+		t.Fatalf("使用中的来源应拒绝删除：%d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -1561,6 +1930,9 @@ func TestDefaultConfigListensOnLAN(t *testing.T) {
 	}
 	if !config.EnableDaeInstall {
 		t.Fatal("dae 版本管理应默认开启")
+	}
+	if !config.EnableSelfUpdate {
+		t.Fatal("面板一键升级应默认开启，并允许在界面关闭")
 	}
 }
 

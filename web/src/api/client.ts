@@ -77,6 +77,13 @@ export function putJSON<T>(path: string, payload: unknown): Promise<T> {
   })
 }
 
+export function deleteJSON<T>(path: string, payload: unknown): Promise<T> {
+  return apiRequest<T>(path, {
+    method: 'DELETE',
+    body: JSON.stringify(payload),
+  })
+}
+
 export async function getDownload(path: string): Promise<{ blob: Blob; filename: string }> {
   const response = await fetch(path, { credentials: 'same-origin' })
   if (!response.ok) {

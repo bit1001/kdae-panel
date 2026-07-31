@@ -60,6 +60,11 @@ export interface ServiceStatus {
   unitPath?: string
 }
 
+export interface NetworkInterface {
+  name: string
+  addresses?: string[]
+}
+
 export interface ConfigDocument {
   path: string
   content: string
@@ -97,6 +102,10 @@ export interface UpstreamVersion {
   installable: boolean
   note?: string
   expiresAt?: string
+  cached?: boolean
+  cachedOnly?: boolean
+  cachedAt?: string
+  cachedBytes?: number
 }
 
 export interface InstalledState {
@@ -139,6 +148,7 @@ export interface InstallJob {
   source?: string
   ref?: string
   label?: string
+  cached?: boolean
   startedAt?: string
   endedAt?: string
   error?: string
@@ -154,7 +164,7 @@ export interface GeoFile {
   shadowed?: string[]
 }
 
-export type GeoSource = 'loyalsoldier' | 'v2fly'
+export type GeoSource = 'loyalsoldier' | 'v2fly' | `custom:${string}`
 
 export interface GeoSourceInfo {
   source: GeoSource
@@ -162,7 +172,20 @@ export interface GeoSourceInfo {
   /** 如实列出全部信任根；同一来源可能横跨多个仓库。 */
   repositories: string[]
   note: string
+  custom?: boolean
 }
+
+export interface CustomGeoSource {
+  id: string
+  source: `custom:${string}`
+  label: string
+  geoipUrl: string
+  geoipSha256Url: string
+  geositeUrl: string
+  geositeSha256Url: string
+}
+
+export type CustomGeoSourceInput = Omit<CustomGeoSource, 'id' | 'source'>
 
 export interface GeoState {
   source: GeoSource
@@ -193,11 +216,12 @@ export interface PanelUpdateCheck {
   error?: string
 }
 
-/** 自升级的可行性；未启用该功能时整个字段不存在。 */
+/** 自升级开关与可行性；正式部署始终返回，关闭时仍可从界面重新启用。 */
 export interface PanelUpdateStatus {
   current: string
   binaryPath: string
   platform: string
+  enabled: boolean
   updatable: boolean
   problem?: string
   previousPath?: string
@@ -207,6 +231,12 @@ export interface PanelUpdatePayload {
   check: PanelUpdateCheck
   status?: PanelUpdateStatus
   job?: InstallJob
+}
+
+/** GitHub Token 永不回传；前端只知道是否配置以及由谁管理。 */
+export interface GitHubCredentialStatus {
+  configured: boolean
+  source?: 'environment' | 'panel'
 }
 
 /** 定时任务（订阅自动刷新 / geo 自动更新）的设置与执行状态，两个端点同构。 */

@@ -9,6 +9,7 @@ package panelupdate
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -17,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -29,8 +31,9 @@ const (
 	probeTimeout = 15 * time.Second
 	// restartDelay 是发出重启请求前留给 HTTP 响应送达的时间。
 	// 请求方需要先收到 202 才能开始轮询，否则它看到的是连接被重置。
-	restartDelay = 1500 * time.Millisecond
-	elfMagic     = "\x7fELF"
+	restartDelay       = 1500 * time.Millisecond
+	elfMagic           = "\x7fELF"
+	maxPreferenceBytes = 4 << 10
 )
 
 // ServiceController 是面板自身 systemd 单元的控制入口。
@@ -49,6 +52,9 @@ type Status struct {
 	Current    string `json:"current"`
 	BinaryPath string `json:"binaryPath"`
 	Platform   string `json:"platform"`
+	// Enabled 是管理员在界面里保存的选择。关闭时仍返回 Status，界面才能
+	// 提供启用入口，而不是把用户赶去 SSH 修改环境文件。
+	Enabled bool `json:"enabled"`
 	// Updatable 为假时界面不应给出升级入口，Problem 说明原因。
 	Updatable bool   `json:"updatable"`
 	Problem   string `json:"problem,omitempty"`
@@ -61,19 +67,24 @@ type Options struct {
 	Version    string
 	BinaryPath string
 	// BackupPath 存放被替换掉的上一版二进制。
-	BackupPath string
-	Fetcher    Fetcher
-	Service    ServiceController
-	Logger     *slog.Logger
+	BackupPath     string
+	PreferencePath string
+	Enabled        bool
+	Fetcher        Fetcher
+	Service        ServiceController
+	Logger         *slog.Logger
 }
 
 type Manager struct {
-	version    string
-	binaryPath string
-	backupPath string
-	fetcher    Fetcher
-	service    ServiceController
-	logger     *slog.Logger
+	version        string
+	binaryPath     string
+	backupPath     string
+	preferencePath string
+	preferenceMu   sync.Mutex
+	enabled        atomic.Bool
+	fetcher        Fetcher
+	service        ServiceController
+	logger         *slog.Logger
 	// probe 运行新二进制自证；测试替换它以免真的执行文件。
 	probe func(ctx context.Context, path string) (string, error)
 	// replacementPendingRestart 一旦替换开始就阻止旧进程再次升级。
@@ -116,15 +127,27 @@ func New(options Options) (*Manager, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Manager{
-		version:    options.Version,
-		binaryPath: binaryPath,
-		backupPath: backupPath,
-		fetcher:    options.Fetcher,
-		service:    options.Service,
-		logger:     logger,
-		probe:      probeVersion,
-	}, nil
+	preferencePath := options.PreferencePath
+	if preferencePath == "" {
+		preferencePath = filepath.Join(filepath.Dir(backupPath), "self-update.json")
+	}
+	manager := &Manager{
+		version:        options.Version,
+		binaryPath:     binaryPath,
+		backupPath:     backupPath,
+		preferencePath: preferencePath,
+		fetcher:        options.Fetcher,
+		service:        options.Service,
+		logger:         logger,
+		probe:          probeVersion,
+	}
+	manager.enabled.Store(options.Enabled)
+	if err := manager.loadPreference(); err != nil {
+		// 偏好损坏不应让整个面板无法启动；保留部署配置给出的默认值，用户可在
+		// 设置页重新保存并覆盖它。
+		logger.Warn("读取面板自升级偏好失败，沿用部署默认值", "error", err)
+	}
+	return manager, nil
 }
 
 func (m *Manager) Status(context.Context) Status {
@@ -132,21 +155,29 @@ func (m *Manager) Status(context.Context) Status {
 		Current:    m.version,
 		BinaryPath: m.binaryPath,
 		Platform:   runtime.GOOS + "/" + runtime.GOARCH,
-	}
-	if m.replacementPendingRestart.Load() {
-		status.Problem = "面板二进制已经进入替换阶段，当前进程必须先手动重启，才能再次升级"
-		return status
+		Enabled:    m.enabled.Load(),
 	}
 	backupInfo, backupErr := os.Lstat(m.backupPath)
 	switch {
 	case backupErr == nil:
 		if !backupInfo.Mode().IsRegular() {
-			status.Problem = fmt.Sprintf("回滚副本路径 %s 已存在且不是普通文件", m.backupPath)
-			return status
+			if status.Enabled {
+				status.Problem = fmt.Sprintf("回滚副本路径 %s 已存在且不是普通文件", m.backupPath)
+				return status
+			}
+			break
 		}
 		status.PreviousPath = m.backupPath
-	case !os.IsNotExist(backupErr):
+	case !os.IsNotExist(backupErr) && status.Enabled:
 		status.Problem = fmt.Sprintf("检查回滚副本路径 %s：%v", m.backupPath, backupErr)
+		return status
+	}
+	// 关闭只影响写操作；当前版本、平台和已有回滚副本仍应如实展示。
+	if !status.Enabled {
+		return status
+	}
+	if m.replacementPendingRestart.Load() {
+		status.Problem = "面板二进制已经进入替换阶段，当前进程必须先手动重启，才能再次升级"
 		return status
 	}
 	// 发布包只有这三个架构；架构对不上时升级必然装出一个跑不起来的二进制
@@ -197,6 +228,9 @@ func (m *Manager) Download(ctx context.Context, version string) (upstream.PanelB
 // 就会收到 SIGTERM，调用方拿到的响应必须在此之前送达。
 func (m *Manager) Apply(ctx context.Context, binary upstream.PanelBinary) error {
 	status := m.Status(ctx)
+	if !status.Enabled {
+		return errors.New("面板一键升级已关闭")
+	}
 	if !status.Updatable {
 		return errors.New(status.Problem)
 	}
@@ -244,6 +278,52 @@ func (m *Manager) Apply(ctx context.Context, binary upstream.PanelBinary) error 
 		return fmt.Errorf("新版本已写入 %s，但请求重启面板失败；请手动重启服务：%w",
 			m.binaryPath, err)
 	}
+	return nil
+}
+
+type preference struct {
+	Enabled bool `json:"enabled"`
+}
+
+// SetEnabled 保存界面里的开关。先持久化再切换内存状态，磁盘失败时界面不会
+// 显示一个重启后就丢失的假成功。
+func (m *Manager) SetEnabled(enabled bool) error {
+	m.preferenceMu.Lock()
+	defer m.preferenceMu.Unlock()
+	encoded, err := json.Marshal(preference{Enabled: enabled})
+	if err != nil {
+		return err
+	}
+	if err := atomicfile.Write(m.preferencePath, encoded, 0o600); err != nil {
+		return fmt.Errorf("保存面板自升级偏好: %w", err)
+	}
+	m.enabled.Store(enabled)
+	return nil
+}
+
+func (m *Manager) loadPreference() error {
+	info, err := os.Lstat(m.preferencePath)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s 不是普通文件", m.preferencePath)
+	}
+	if info.Size() <= 0 || info.Size() > maxPreferenceBytes {
+		return fmt.Errorf("%s 大小 %d 非法", m.preferencePath, info.Size())
+	}
+	content, err := os.ReadFile(m.preferencePath)
+	if err != nil {
+		return err
+	}
+	var saved preference
+	if err := json.Unmarshal(content, &saved); err != nil {
+		return fmt.Errorf("解析 %s: %w", m.preferencePath, err)
+	}
+	m.enabled.Store(saved.Enabled)
 	return nil
 }
 

@@ -18,19 +18,25 @@ import (
 )
 
 type fakeFetcher struct {
-	binary []byte
+	binary     []byte
+	versions   []upstream.Version
+	listErr    error
+	resolveErr error
+	fetchErr   error
+	fetches    int
 }
 
 func (f *fakeFetcher) List(context.Context, upstream.Source, int) ([]upstream.Version, error) {
-	return nil, nil
+	return f.versions, f.listErr
 }
 
 func (f *fakeFetcher) Resolve(context.Context, upstream.Source, string, upstream.Platform) (upstream.Asset, error) {
-	return upstream.Asset{}, nil
+	return upstream.Asset{}, f.resolveErr
 }
 
 func (f *fakeFetcher) FetchBundle(context.Context, upstream.Asset) (upstream.Bundle, error) {
-	return upstream.Bundle{Binary: f.binary}, nil
+	f.fetches++
+	return upstream.Bundle{Binary: f.binary}, f.fetchErr
 }
 
 // fakeProbe 按二进制内容决定行为，从而模拟"新版本跑不起来/不认配置"。
@@ -53,8 +59,12 @@ func (p fakeProbe) Validate(context.Context, string) error {
 }
 
 type fakeService struct {
-	execStart string
-	actions   []host.Action
+	execStart     string
+	unitPath      string
+	unitFileState string
+	actions       []host.Action
+	// actionErrors 可让某个动作的前若干次调用失败；切片会按调用顺序消费。
+	actionErrors map[host.Action][]error
 	// failRestart 指定第几次 restart 之后服务起不来（从 1 起算，0 表示始终能起来）。
 	//
 	// 刻意不按"第几次状态查询"计数：那个次数取决于事务内部调了多少次 Status，
@@ -66,14 +76,22 @@ type fakeService struct {
 	// 模拟"两次采样之间服务已经崩过一轮又被拉起来"——ActiveState 全程 active。
 	restartsGrow bool
 	restartsAt   uint64
+	activeState  string
 	statusErr    error
 	actionErr    error
+	logs         []host.LogEntry
 }
 
 func (s *fakeService) Action(_ context.Context, action host.Action) error {
 	s.actions = append(s.actions, action)
 	if action == host.ActionRestart {
 		s.restarts++
+	}
+	if failures := s.actionErrors[action]; len(failures) > 0 {
+		s.actionErrors[action] = failures[1:]
+		if failures[0] != nil {
+			return failures[0]
+		}
 	}
 	return s.actionErr
 }
@@ -82,7 +100,10 @@ func (s *fakeService) Status(context.Context) (host.Status, error) {
 	if s.statusErr != nil {
 		return host.Status{}, s.statusErr
 	}
-	state := "active"
+	state := s.activeState
+	if state == "" {
+		state = "active"
+	}
 	if s.failRestart > 0 && s.restarts == s.failRestart {
 		state = "failed"
 	}
@@ -93,8 +114,14 @@ func (s *fakeService) Status(context.Context) (host.Status, error) {
 		ActiveState:   state,
 		SubState:      "running",
 		ExecStartPath: s.execStart,
+		UnitPath:      s.unitPath,
+		UnitFileState: s.unitFileState,
 		Restarts:      s.restartsAt,
 	}, nil
+}
+
+func (s *fakeService) Logs(context.Context, int) ([]host.LogEntry, error) {
+	return append([]host.LogEntry(nil), s.logs...), nil
 }
 
 func newTestInstaller(t *testing.T, fetcher *fakeFetcher, service *fakeService) (*Installer, string) {
@@ -304,7 +331,10 @@ func TestInstallRejectsBinaryThatRejectsConfig(t *testing.T) {
 func TestInstallRollsBackWhenServiceFailsToStart(t *testing.T) {
 	fetcher := &fakeFetcher{}
 	// 装上去的那次重启起不来；随后的回滚重启能起来
-	service := &fakeService{failRestart: 1}
+	service := &fakeService{
+		failRestart: 1,
+		logs:        []host.LogEntry{{Message: "country code twitter not found in /etc/dae/geoip.dat"}},
+	}
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
@@ -323,6 +353,9 @@ func TestInstallRollsBackWhenServiceFailsToStart(t *testing.T) {
 	}
 	if strings.Contains(applyErr.Error(), "服务仍未恢复") {
 		t.Fatalf("服务已恢复，错误描述不应说仍未恢复: %v", applyErr)
+	}
+	if !strings.Contains(applyErr.Error(), "geoip:twitter") || !strings.Contains(applyErr.Error(), "Geo 数据") {
+		t.Fatalf("版本切换失败应指出 Geo 分类根因：%v", applyErr)
 	}
 	if content, _ := os.ReadFile(binaryPath); string(content) != string(elf("v1")) {
 		t.Fatalf("回滚后磁盘内容 = %q，应恢复为旧版本", content)
@@ -367,6 +400,10 @@ func TestFailedInstallKeepsExistingRollbackPoint(t *testing.T) {
 func TestInstallDetectsCrashLoopWithinObservationWindow(t *testing.T) {
 	service := &fakeService{restartsGrow: true}
 	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, service)
+	// 零窗口刻意压住边界：第一次采样只能建立基线，即使窗口已经结束，
+	// 也必须再采一次才能判断 NRestarts 是否增长。测试因此不依赖 CI 调度速度。
+	installer.health = 0
+	installer.interval = 0
 	seed(t, binaryPath, "v1")
 
 	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2")
@@ -446,9 +483,13 @@ func TestInstallRejectsEmptyBinary(t *testing.T) {
 func TestDownloadReturnsVerifiedBinary(t *testing.T) {
 	fetcher := &fakeFetcher{binary: elf("v2")}
 	installer, _ := newTestInstaller(t, fetcher, &fakeService{})
-	bundle, err := installer.Download(context.Background(), upstream.SourceOfficial, "v2.0.0")
+	bundle, cached, err := installer.Acquire(
+		context.Background(), upstream.SourceOfficial, "v2.0.0", "v2.0.0", false)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if cached {
+		t.Fatal("第一次获取不应命中缓存")
 	}
 	if string(bundle.Binary) != string(elf("v2")) {
 		t.Fatalf("下载内容 = %q", bundle.Binary)

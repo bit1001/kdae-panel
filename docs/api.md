@@ -70,9 +70,11 @@ X-CSRF-Token: <csrfToken>
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/dae/install` | 当前安装状态与正在进行的任务 |
-| `GET` | `/dae/versions?source=official\|kdae` | 列出可安装版本 |
+| `GET` | `/dae/versions?source=official\|kdae` | 列出上游与本地版本 |
 | `POST` | `/dae/install` | 开始安装指定版本 |
+| `DELETE` | `/dae/cache` | 删除指定版本的本地缓存 |
 | `POST` | `/dae/rollback` | 回滚到上一版本 |
+| `POST` | `/dae/uninstall` | 卸载面板管理的 dae，可选清理配置与 geo 数据 |
 
 安装请求体：
 
@@ -82,13 +84,39 @@ X-CSRF-Token: <csrfToken>
 
 `source` 只接受 `official` 与 `kdae` 两个枚举值，仓库地址在代码中写死，不接受外部指定。`ref` 对官方来源是发布 tag，对 kdae 是构建编号。`GET /dae/versions` 另接受 `limit` 参数（1–100，默认 30），超出范围返回 `400 invalid_limit`。
 
+版本响应在上游字段之外附带 `cached`、`cachedAt`、`cachedBytes`；只存在于本机、不在当前上游清单中的版本还会带 `cachedOnly`。已过期的 kdae 构建只要本地缓存完整仍然可切换；上游暂时不可访问时，只要存在缓存也会返回本地版本。缓存按来源、版本与本机 CPU 平台隔离，真正安装前会重新计算二进制 SHA-256，而不是只信任缓存索引。
+
+GitHub JSON 元数据另有 10 分钟进程内缓存；同 URL 的并发请求只访问上游一次，刷新失败时继续使用最近成功结果。凭据管理端点如下，任何响应都只返回 `configured` 与 `source`，不会返回 Token：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/settings/github` | 查询是否配置 GitHub Token 及来源（`panel` / `environment`） |
+| `PUT` | `/settings/github` | 保存 `{"token":"..."}`，写入 `0600` 独立文件并立即生效 |
+| `DELETE` | `/settings/github` | 清除面板保存的 Token；环境变量管理时返回 `409` |
+
+删除缓存请求体：
+
+```json
+{ "source": "official", "ref": "v2.0.0" }
+```
+
+删除只影响 `/var/lib/kdae-panel/dae-versions/` 下的对应缓存，不修改当前运行的 `/usr/bin/dae`，也不删除安装事务的上一版回滚点。版本不存在返回 `404 cached_version_not_found`。
+
 机器上还没有 dae 时，`GET /dae/install` 的响应会附带 `provision` 字段，说明首次安装是否可行、将要写入哪些路径、以及缺少哪些可写目录。此时提交安装会走首次安装：除可执行文件外还写入 geo 数据、种子配置与 systemd 单元，然后 `daemon-reload`，但**不会启动服务**。
 
 任务进行中（`downloading`/`applying`）的响应**不含** `provision`：该字段要靠实际试写目标目录才能算出来，而界面每两秒轮询一次，其中一个探测目标正是 systemd 在 inotify 监视的单元目录。客户端应沿用上一次拿到的值，而不是当作"首次安装已不可行"。
 
-安装与回滚耗时以分钟计，远超 HTTP 写超时，因此立即返回 `202` 与任务快照，由客户端轮询 `GET /dae/install` 获取进度。任务阶段依次为 `downloading`、`applying`，终态为 `done` 或 `failed`。同一时刻只允许一个任务，重复提交返回 `409 install_in_progress`。
+安装、回滚与卸载都立即返回 `202` 与任务快照，由客户端轮询 `GET /dae/install` 获取进度。安装任务依次经过 `downloading`、`applying`；命中本地版本时仍从 `downloading` 开始，但任务会带 `cached: true` 并很快进入替换阶段。回滚与卸载直接进入 `applying`，终态均为 `done` 或 `failed`。同一时刻只允许一个版本管理任务，重复提交返回 `409 install_in_progress`。
 
-下载与校验不占用全局控制门，只有替换与重启阶段才进入串行区，避免几十兆的下载把配置保存一并堵住。
+卸载请求体可选，零值是安全默认：
+
+```json
+{ "purgeConfig": false, "purgeGeo": false }
+```
+
+`purgeConfig` 与 `purgeGeo` 相互独立，只有显式设为 `true` 才删除对应数据。geo 清理覆盖 dae 搜索路径里所有面板可见的副本，受 `ProtectHome=true` 隐藏的 `/root/.local/share/dae` 不在其中。卸载只接受面板有安装账本且二进制摘要未漂移的 dae，并要求 systemd 单元位于面板管理的标准路径。它会停止并禁用 dae，移除可执行文件、服务单元与版本回滚记录；文件移除、可选的数据清理与 `daemon-reload` 属于同一事务，失败时会恢复文件、开机启动状态和原运行状态。
+
+读取缓存、下载与校验不占用全局控制门，只有替换与重启阶段才进入串行区，避免几十兆的 I/O 把配置保存一并堵住。普通升级和切换只缓存可执行文件；首次安装还需要服务单元、种子配置与 geo，因此即使该版本已有二进制缓存，也会重新取得并校验完整发布包。
 
 校验和缺失或格式不符时拒绝安装，没有跳过校验的开关。kdae 的构建产物保留 90 天，过期版本在列表中标记为不可安装；面板只接受本仓库自己的构建，解析时会重新核对 `head_repository`、事件类型、分支与工作流文件路径四项。
 
@@ -98,8 +126,12 @@ X-CSRF-Token: <csrfToken>
 |---|---|---|
 | `GET` | `/dae/geo` | geo 数据现状、可选来源与正在进行的任务 |
 | `POST` | `/dae/geo` | 更新到指定来源的最新版 |
+| `GET` | `/dae/geo/sources` | 列出管理员保存的自定义来源 |
+| `POST` | `/dae/geo/sources` | 添加自定义来源 |
+| `PUT` | `/dae/geo/sources/{id}` | 修改自定义来源 |
+| `DELETE` | `/dae/geo/sources/{id}` | 删除未在使用的自定义来源 |
 
-独立开关 `KDAE_PANEL_ENABLE_GEO_UPDATE`，与 dae 版本管理互不影响；未启用时返回 `503 geo_update_disabled`。
+Geo 数据管理在登录后始终可用，与 dae 版本管理互不影响；旧版环境文件里的 `KDAE_PANEL_ENABLE_GEO_UPDATE` 仅为启动参数兼容保留，不再隐藏功能。
 
 更新请求体（可省略，此时沿用 `status.defaultSource`）：
 
@@ -107,13 +139,17 @@ X-CSRF-Token: <csrfToken>
 { "source": "loyalsoldier" }
 ```
 
-`source` 只接受 `loyalsoldier` 与 `v2fly` 两个枚举值，仓库地址在代码中写死，不接受外部指定；未知值返回 `400 invalid_geo_source`。**两个来源的规则集不是同一套**，切换会改变 `geosite:` 规则匹配的域名集合。
+`source` 接受内置的 `loyalsoldier`、`v2fly`，或由来源管理接口生成的 `custom:<id>`；未知或已经删除的来源返回 `400 invalid_geo_source`。不同来源的规则集可能不同，切换会改变 `geosite:` 规则匹配的域名集合。
+
+自定义来源请求体包含 `label`、`geoipUrl`、`geoipSha256Url`、`geositeUrl`、`geositeSha256Url`。四条地址都必须是公网 HTTPS；保存时拒绝 userinfo、内网字面地址与 URL 片段，下载首跳和每次重定向会重新解析 DNS，并在实际连接前再次拒绝非公网地址。自定义请求使用独立客户端，不携带 GitHub Token。每个数据文件上限 64 MiB，校验文件上限 64 KiB，没有跳过 SHA-256 的开关。来源保存在权限 `0600` 的 `KDAE_PANEL_GEO_SOURCES_FILE`；当前更新记录正在引用的来源不能直接删除，需先用另一个来源成功更新。
 
 `GET` 返回 `status.sources`（每个来源的标识、展示名、全部信任根仓库与说明）、`status.defaultSource`（界面该预选哪个——用过就是上次那个）、`status.targetDir`（本次会写入哪个目录）、`status.searchPath`（dae 的完整查找顺序）、每个文件的实际路径与大小，以及 `files[].shadowed`——被优先级更高的副本遮蔽、因而不会生效的同名文件。
 
 `POST` 立即返回 `202` 与任务快照，进度靠轮询 `GET /dae/geo`，阶段与安装任务一致（`downloading` → `applying` → `done`/`failed`）。同一时刻只允许一个 geo 任务，重复提交返回 `409 geo_update_in_progress`；它与安装任务各有各的任务槽，但落盘阶段共用全局控制门。
 
 更新只触发 `dae reload`，不重启服务。若 dae 不接受新数据，面板会自动还原旧文件并再 reload 一次，任务标记为 `failed`。
+
+dae 的 `validate` 不检查 `geoip:` / `geosite:` 分类是否真实存在。Geo 更新重载、启动、重启或版本切换因分类缺失失败时，面板会从 dae 命令输出或本次操作后的 journald 日志明确指出缺失分类并引导到 Geo 数据页；版本切换仍按原事务回滚二进制。
 
 ## 定时任务（订阅自动刷新 / geo 自动更新）
 
@@ -149,15 +185,18 @@ dae 只在重载时重新拉取 `subscription` 链接，因此"订阅定时刷�
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `GET` | `/panel/update` | 新版本检查结果与自升级状态 |
+| `POST` | `/panel/update/check` | 立即绕过缓存检查面板新版本 |
+| `PUT` | `/panel/update/preference` | 在 UI 中持久化一键升级开关 |
 | `POST` | `/panel/update` | 触发一键自升级 |
 
 `GET` 响应里的 `check` 含 `current`、`latest`、`updateAvailable`、`checkedAt`，检查失败时带 `error`；
 结果按 TTL 缓存（成功 6 小时、失败 15 分钟），dev 构建不发起检查，
 `KDAE_PANEL_DISABLE_UPDATE_CHECK=true` 时不再联网、恒不提示。
+手动检查接口返回同样的 `check`、`status` 与 `job` 结构，会绕过成功缓存；同一面板在 1 分钟冷却期内重复调用直接返回上次结果。
 
-自升级启用（`KDAE_PANEL_ENABLE_SELF_UPDATE`）时，响应额外带 `status`（是否可升级、
-二进制路径、上一版副本位置）与 `job`（任务进度）；未启用时这两个字段不存在，
-`POST` 返回 `503 panel_self_update_disabled`。
+正式部署的响应始终带 `status`（`enabled`、是否可升级、二进制路径、上一版副本位置）
+与 `job`（任务进度）。`PUT /panel/update/preference` 接受 `{"enabled":true|false}`，
+原子保存到面板数据目录并返回新状态；关闭时 `POST` 返回 `409 panel_self_update_disabled`。
 
 `POST` 可选 `{"version":"v0.2.0"}`，省略则取最新正式发布；立即返回 `202` 并在后台执行：
 下载 → 比对 `SHA256SUMS` → 新二进制 `-version` 自证 → 备份上一版 → 原子替换 →
@@ -205,6 +244,7 @@ dae 只在重载时重新拉取 `subscription` 链接，因此"订阅定时刷�
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| `GET` | `/host/interfaces` | 本机网络接口及其 IP/CIDR 地址，供 global 接口选择器使用 |
 | `GET` | `/service` | systemd 状态与资源数据 |
 | `POST` | `/service/actions/start` | 启动 dae |
 | `POST` | `/service/actions/stop` | 停止 dae |

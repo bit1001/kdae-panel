@@ -26,6 +26,7 @@ import { appendToSection, isQuotable, isValidTag, quote, readSection, removeLine
 import { parseScheme, supportsPersistence, togglePersistence } from '../../utils/subscription'
 import { formatDateTime } from '../../utils/format'
 import { entryActions, useEntryRewrite, type EntryTarget } from './entry'
+import SectionEditorModal from './SectionEditorModal.vue'
 
 // 订阅内容始终由 dae 在 reload 时拉取，面板只负责维护配置里的那一行。
 const content = defineModel<string>({ required: true })
@@ -39,6 +40,7 @@ const dialog = useDialog()
 const { captureEntry, rewriteEntry } = useEntryRewrite(content, message)
 
 const subscriptions = computed<Entry[]>(() => readSection(content.value, 'subscription').entries)
+const sourceVisible = ref(false)
 
 // ---- 添加 ----
 const subscriptionTag = ref('')
@@ -141,7 +143,7 @@ const subscriptionColumns: DataTableColumns<Entry> = [
   {
     title: '操作',
     key: 'actions',
-    width: 100,
+    width: 150,
     render: (row) => entryActions(row, [
       { title: '编辑', icon: CreateOutline, onClick: () => openSubscriptionEditor(row) },
       {
@@ -150,7 +152,7 @@ const subscriptionColumns: DataTableColumns<Entry> = [
         type: 'error',
         onClick: () => { content.value = removeLine(content.value, row.lineStart, row.lineEnd) },
       },
-    ]),
+    ], true),
   },
 ]
 
@@ -248,7 +250,7 @@ onMounted(() => void loadSchedule())
 </script>
 
 <template>
-  <NCard title="订阅" class="panel-card" content-style="padding: 0;">
+  <NCard title="订阅" class="panel-card" content-style="padding: 0;" data-testid="subscriptions-card">
     <template #header-extra>
       <NSpace size="small" align="center">
         <NTag size="small" :bordered="false">{{ subscriptions.length }} 个</NTag>
@@ -258,23 +260,12 @@ onMounted(() => void loadSchedule())
         <NButton size="small" quaternary @click="openSchedule">
           <template #icon><NIcon><TimerOutline /></NIcon></template>自动刷新
         </NButton>
+        <NButton size="small" quaternary @click="sourceVisible = true">
+          <template #icon><NIcon><CreateOutline /></NIcon></template>编辑原文
+        </NButton>
       </NSpace>
     </template>
-    <NDataTable
-      :columns="subscriptionColumns"
-      :data="subscriptions"
-      :row-key="(row: Entry) => row.lineStart"
-      :bordered="false"
-      :scroll-x="620"
-      size="small"
-    >
-      <template #empty>
-        <div class="orchestrate-empty">
-          <NText depth="3">还没有订阅。订阅内容由 dae 在重载时拉取。</NText>
-        </div>
-      </template>
-    </NDataTable>
-    <div class="orchestrate-add">
+    <div class="orchestrate-add" data-testid="subscription-add">
       <NInputGroup>
         <NInput v-model:value="subscriptionTag" placeholder="标签(可选)" class="orchestrate-tag-input" />
         <NInput v-model:value="subscriptionURL" placeholder="https://example.com/subscription" @keyup.enter="addSubscription" />
@@ -290,6 +281,21 @@ onMounted(() => void loadSchedule())
         订阅刷新：{{ scheduleSummary }}<template v-if="reloadSchedule?.nextRunAt">，下次 {{ formatDateTime(reloadSchedule.nextRunAt) }}</template>
       </NText>
     </div>
+    <NDataTable
+      data-testid="subscription-list"
+      :columns="subscriptionColumns"
+      :data="subscriptions"
+      :row-key="(row: Entry) => row.lineStart"
+      :bordered="false"
+      :scroll-x="620"
+      size="small"
+    >
+      <template #empty>
+        <div class="orchestrate-empty">
+          <NText depth="3">还没有订阅。订阅内容由 dae 在重载时拉取。</NText>
+        </div>
+      </template>
+    </NDataTable>
   </NCard>
 
   <NModal :show="editTarget !== null" preset="card" title="编辑订阅" class="orchestrate-modal" @update:show="editTarget = null">
@@ -338,4 +344,12 @@ onMounted(() => void loadSchedule())
       </NSpace>
     </template>
   </NModal>
+
+  <SectionEditorModal
+    v-model:show="sourceVisible"
+    v-model:content="content"
+    section="subscription"
+    title="编辑订阅原文"
+    description="这里只替换 subscription 节内部内容，其他配置与注释保持不变。应用后仍需在页面顶部保存或保存并重载。"
+  />
 </template>

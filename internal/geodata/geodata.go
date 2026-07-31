@@ -32,6 +32,14 @@ type Fetcher interface {
 	Fetch(ctx context.Context, release upstream.GeoRelease) (upstream.GeoData, error)
 }
 
+// SourceEditor 是 Fetcher 可选实现的自定义来源维护能力。
+type SourceEditor interface {
+	CustomSources() []upstream.CustomGeoSource
+	CreateCustomSource(source upstream.CustomGeoSource) (upstream.CustomGeoSource, error)
+	UpdateCustomSource(id string, source upstream.CustomGeoSource) (upstream.CustomGeoSource, error)
+	DeleteCustomSource(id string) error
+}
+
 // ServiceController 读取 dae 服务状态，用于发现 DAE_LOCATION_ASSET。
 type ServiceController interface {
 	Status(ctx context.Context) (host.Status, error)
@@ -127,4 +135,44 @@ func New(options Options) (*Manager, error) {
 		reloader:   options.Reloader,
 		logger:     logger,
 	}, nil
+}
+
+func (m *Manager) sourceEditor() (SourceEditor, error) {
+	editor, ok := m.fetcher.(SourceEditor)
+	if !ok {
+		return nil, errors.New("当前 geo 取回器不支持自定义来源")
+	}
+	return editor, nil
+}
+
+func (m *Manager) CustomSources() []upstream.CustomGeoSource {
+	editor, err := m.sourceEditor()
+	if err != nil {
+		return nil
+	}
+	return editor.CustomSources()
+}
+
+func (m *Manager) CreateCustomSource(source upstream.CustomGeoSource) (upstream.CustomGeoSource, error) {
+	editor, err := m.sourceEditor()
+	if err != nil {
+		return upstream.CustomGeoSource{}, err
+	}
+	return editor.CreateCustomSource(source)
+}
+
+func (m *Manager) UpdateCustomSource(id string, source upstream.CustomGeoSource) (upstream.CustomGeoSource, error) {
+	editor, err := m.sourceEditor()
+	if err != nil {
+		return upstream.CustomGeoSource{}, err
+	}
+	return editor.UpdateCustomSource(id, source)
+}
+
+func (m *Manager) DeleteCustomSource(id string) error {
+	editor, err := m.sourceEditor()
+	if err != nil {
+		return err
+	}
+	return editor.DeleteCustomSource(id)
 }

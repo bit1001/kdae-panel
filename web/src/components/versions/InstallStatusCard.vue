@@ -8,6 +8,7 @@ import { sourceName } from './sources'
 // 纯展示卡片：状态由 VersionsView 加载并轮询，这里只负责如实呈现。
 const props = defineProps<{
   loading: boolean
+  busy: boolean
   status: InstallStatus | null
   provision: InstallProvision | null
 }>()
@@ -32,18 +33,22 @@ const firstInstall = computed(() => props.provision?.possible === true)
     </template>
     <!-- 独立成一条，不接在 provision 的 v-else-if 后面：ready 为假时后端
          几乎总会带上 provision，挂成 else 分支等于让真正的故障原因永远不显示 -->
-    <NAlert v-if="status?.problem" type="warning" :bordered="false" class="card-alert">
+    <NAlert v-if="!busy && status?.problem" type="warning" :bordered="false" class="card-alert">
       {{ status.problem }}
     </NAlert>
-    <NAlert
-      v-for="warning in status?.warnings || []"
-      :key="warning"
-      type="warning"
-      :bordered="false"
-      class="card-alert"
-    >
-      {{ warning }}
-    </NAlert>
+    <!-- applying 期间磁盘与账本短暂不一致、暂存回滚点存在都是事务的正常中间态。
+         此时只保留页面级进度提示，不能把正常过程渲染成两条故障告警。 -->
+    <template v-if="!busy">
+      <NAlert
+        v-for="warning in status?.warnings || []"
+        :key="warning"
+        type="warning"
+        :bordered="false"
+        class="card-alert"
+      >
+        {{ warning }}
+      </NAlert>
+    </template>
     <dl v-if="!firstInstall" class="details-list">
       <div>
         <dt>运行版本</dt>
@@ -81,7 +86,7 @@ const firstInstall = computed(() => props.provision?.possible === true)
         <dd class="mono">{{ status?.platform || '—' }}</dd>
       </div>
     </dl>
-    <NAlert v-if="status?.drifted" type="warning" :bordered="false">
+    <NAlert v-if="!busy && status?.drifted" type="warning" :bordered="false">
       磁盘上的二进制与面板记录不一致，说明它在面板之外被替换过。
     </NAlert>
   </NCard>

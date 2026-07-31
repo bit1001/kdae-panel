@@ -10,6 +10,7 @@ import (
 	"slices"
 
 	"github.com/tuoro/kdae-panel/internal/atomicfile"
+	"github.com/tuoro/kdae-panel/internal/daediag"
 	"github.com/tuoro/kdae-panel/internal/upstream"
 )
 
@@ -63,6 +64,7 @@ func (m *Manager) Apply(ctx context.Context, data upstream.GeoData) (Status, err
 	}
 
 	if err := m.reloader.Reload(ctx); err != nil {
+		err = daediag.ExplainGeoError(err)
 		// 换上去 dae 不认，退回原样并让它重新读回旧数据。
 		restoreErr := transaction.rollback()
 		if restoreErr != nil {
@@ -70,6 +72,7 @@ func (m *Manager) Apply(ctx context.Context, data upstream.GeoData) (Status, err
 				"新 geo 数据导致 dae 重载失败（%w），且旧数据未能还原：%v", err, restoreErr)
 		}
 		if reloadErr := m.reloader.Reload(ctx); reloadErr != nil {
+			reloadErr = daediag.ExplainGeoError(reloadErr)
 			return Status{}, fmt.Errorf(
 				"新 geo 数据导致 dae 重载失败（%w），旧数据已还原但重载仍未成功：%v", err, reloadErr)
 		}

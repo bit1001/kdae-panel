@@ -14,12 +14,13 @@ import {
   useMessage,
   type DataTableColumns,
 } from 'naive-ui'
-import { DownloadOutline, FlashOutline, PricetagOutline, TrashOutline } from '@vicons/ionicons5'
+import { CreateOutline, DownloadOutline, FlashOutline, PricetagOutline, TrashOutline } from '@vicons/ionicons5'
 import { postJSON } from '../../api/client'
 import type { LatencyResult, LatencyTarget } from '../../types/api'
 import { appendToSection, isQuotable, isValidTag, quote, readSection, removeLine, type Entry } from '../../utils/daeconf'
 import { parseNodeLink, type NodeLinkInfo } from '../../utils/nodelink'
 import { entryActions, useEntryRewrite, type EntryTarget } from './entry'
+import SectionEditorModal from './SectionEditorModal.vue'
 
 interface NodeRow {
   entry: Entry
@@ -29,6 +30,7 @@ interface NodeRow {
 const content = defineModel<string>({ required: true })
 const message = useMessage()
 const { captureEntry, rewriteEntry } = useEntryRewrite(content, message)
+const sourceVisible = ref(false)
 
 const nodes = computed<NodeRow[]>(() =>
   readSection(content.value, 'node').entries.map((entry) => ({ entry, info: parseNodeLink(entry.value) })),
@@ -82,7 +84,7 @@ function applyTag() {
     return
   }
   if (!isQuotable(target.entry.value)) {
-    message.error('该链接同时包含单引号和双引号，无法安全改写，请在配置管理页编辑原文')
+    message.error('该链接同时包含单引号和双引号，无法安全改写，请使用卡片右上角的原文编辑')
     return
   }
   const line = tag === '' ? quote(target.entry.value) : `${tag}: ${quote(target.entry.value)}`
@@ -209,7 +211,7 @@ const nodeColumns: DataTableColumns<NodeRow> = [
 </script>
 
 <template>
-  <NCard title="节点" class="panel-card" content-style="padding: 0;">
+  <NCard title="节点" class="panel-card" content-style="padding: 0;" data-testid="nodes-card">
     <template #header-extra>
       <NSpace size="small">
         <NTag size="small" :bordered="false">{{ nodes.length }} 个</NTag>
@@ -218,6 +220,9 @@ const nodeColumns: DataTableColumns<NodeRow> = [
         </NButton>
         <NButton size="small" type="primary" @click="importVisible = true">
           <template #icon><NIcon><DownloadOutline /></NIcon></template>导入节点
+        </NButton>
+        <NButton size="small" quaternary @click="sourceVisible = true">
+          <template #icon><NIcon><CreateOutline /></NIcon></template>编辑原文
         </NButton>
       </NSpace>
     </template>
@@ -268,4 +273,12 @@ const nodeColumns: DataTableColumns<NodeRow> = [
       </NSpace>
     </template>
   </NModal>
+
+  <SectionEditorModal
+    v-model:show="sourceVisible"
+    v-model:content="content"
+    section="node"
+    title="编辑节点原文"
+    description="这里只替换 node 节内部内容，适合处理跨行节点或无法用表格安全改写的链接。其他配置保持不变。"
+  />
 </template>

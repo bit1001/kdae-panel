@@ -1,10 +1,9 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, h, ref } from 'vue'
 import {
+  NAlert,
   NButton,
   NCard,
-  NCheckbox,
-  NCheckboxGroup,
   NIcon,
   NInput,
   NInputGroup,
@@ -13,15 +12,17 @@ import {
   NPopconfirm,
   NSelect,
   NSpace,
+  NSwitch,
   NTag,
   NText,
   NTooltip,
   useMessage,
+  type SelectOption,
 } from 'naive-ui'
-import { AddOutline, TrashOutline } from '@vicons/ionicons5'
+import { AddOutline, CreateOutline, TrashOutline } from '@vicons/ionicons5'
 import {
   addGroup,
-  addGroupFilters,
+  isQuotable,
   isValidTag,
   parseGroups,
   readSection,
@@ -30,12 +31,23 @@ import {
   setGroupPolicy,
   type Group,
 } from '../../utils/daeconf'
+import {
+  createGroupFilter,
+  describeGroupFilter,
+  parseGroupFilter,
+  serializeGroupFilter,
+  type GroupFilterDraft,
+  type GroupFilterKind,
+} from '../../utils/group'
+import { parseNodeLink } from '../../utils/nodelink'
+import SectionEditorModal from './SectionEditorModal.vue'
 
 const content = defineModel<string>({ required: true })
 const message = useMessage()
 
 const groups = computed<Group[]>(() => parseGroups(content.value))
 const groupNames = computed(() => new Set(groups.value.map((group) => group.name)))
+const sourceVisible = ref(false)
 
 const POLICY_OPTIONS = [
   { label: 'min_moving_avg · 移动平均延迟最小', value: 'min_moving_avg' },
@@ -83,62 +95,149 @@ function changeFixedIndex(group: Group, index: number | null) {
   content.value = setGroupPolicy(content.value, group, `fixed(${index ?? 0})`)
 }
 
-const filterTarget = ref<{ group: Group; index: number } | null>(null)
-const filterValue = ref('')
-const allNodeNames = computed(() =>
-  readSection(content.value, 'node').entries.map((e) => e.tag).filter((t): t is string => t !== null),
-)
+const FILTER_KIND_OPTIONS = [
+  { label: '指定节点', value: 'nodes' },
+  { label: '指定订阅', value: 'subscriptions' },
+  { label: '节点名称关键词', value: 'nameKeyword' },
+  { label: '节点名称正则', value: 'nameRegex' },
+  { label: '高级表达式', value: 'raw' },
+]
 
-function openFilterEditor(group: Group, index: number) {
-  filterTarget.value = { group, index }
-  filterValue.value = group.filters[index]?.value || ''
+interface ResourceOption extends SelectOption {
+  label: string
+  value: string
+  description?: string
 }
 
-function applyFilter() {
-  const target = filterTarget.value
+const subscriptionOptions = computed<ResourceOption[]>(() => readSection(content.value, 'subscription').entries
+  .filter((entry) => entry.tag)
+  .map((entry) => ({ label: entry.tag!, value: entry.tag!, description: entry.value })))
+
+const nodeOptions = computed<ResourceOption[]>(() => {
+  const options: ResourceOption[] = []
+  const seen = new Set<string>()
+  for (const entry of readSection(content.value, 'node').entries) {
+    const info = parseNodeLink(entry.value)
+    const value = (entry.tag || info?.name || '').trim()
+    if (value === '' || !isQuotable(value) || seen.has(value)) continue
+    seen.add(value)
+    const details = [
+      entry.tag && info?.name && info.name !== entry.tag ? info.name : '',
+      info?.protocol,
+      info?.host,
+    ].filter(Boolean).join(' · ')
+    options.push({ label: value, value, description: details || undefined })
+  }
+  return options
+})
+
+function renderResourceLabel(option: SelectOption) {
+  const label = typeof option.label === 'string' ? option.label : String(option.value || '')
+  const description = typeof option.description === 'string' ? option.description : ''
+  return h('div', { class: 'group-resource-option' }, [
+    h('strong', label),
+    description ? h('span', { class: 'group-resource-option-meta' }, description) : null,
+  ])
+}
+
+const groupEditVisible = ref(false)
+const groupTarget = ref<{ index: number; snapshot: string } | null>(null)
+const groupPolicy = ref('min_moving_avg')
+const groupFixedIndex = ref(0)
+const groupFilters = ref<GroupFilterDraft[]>([])
+
+function openGroupEditor(groupIndex: number) {
+  const group = groups.value[groupIndex]
+  if (!group) return
+  if ((group.policy && !group.policy.editable) || group.filters.some((filter) => !filter.editable)) {
+    message.warning('该分组含跨行或重复声明，请使用卡片右上角的原文编辑')
+    return
+  }
+  const policy = parsePolicy(group.policy?.value)
+  groupTarget.value = {
+    index: groupIndex,
+    snapshot: content.value.slice(group.section.nameStart, group.section.bodyEnd + 1),
+  }
+  groupPolicy.value = policy.name
+  groupFixedIndex.value = policy.index
+  groupFilters.value = group.filters.map((filter) => parseGroupFilter(filter.value))
+  groupEditVisible.value = true
+}
+
+function addFilter(kind: GroupFilterKind) {
+  groupFilters.value.push(createGroupFilter(kind))
+}
+
+function applyGroupEdit() {
+  const target = groupTarget.value
   if (!target) return
-  content.value = setGroupFilter(content.value, target.group, target.index, filterValue.value.trim())
-  filterTarget.value = null
-}
+  const current = groups.value[target.index]
+  if (!current || content.value.slice(current.section.nameStart, current.section.bodyEnd + 1) !== target.snapshot) {
+    message.error('配置在编辑期间发生了变化，请关闭后重新打开')
+    return
+  }
+  const serialized = groupFilters.value.map(serializeGroupFilter)
+  if (serialized.some((value) => value === null)) {
+    message.error('过滤条件不能为空；请选择节点或订阅，名称也不能同时含单双引号')
+    return
+  }
 
-const nodePickerVisible = ref(false)
-const selectedNodeNames = ref<string[]>([])
-
-function openNodePicker() {
-  selectedNodeNames.value = []
-  nodePickerVisible.value = true
-}
-
-function applyNodePicker() {
-  const picked = selectedNodeNames.value.filter(Boolean)
-  if (picked.length === 0) return
-  const target = filterTarget.value
-  if (!target) return
-  content.value = addGroupFilters(content.value, target.group, picked.map((n) => `name(${n})`))
-  filterTarget.value = null
-  nodePickerVisible.value = false
+  let next = content.value
+  for (let index = current.filters.length - 1; index >= 0; index -= 1) {
+    next = setGroupFilter(next, current, index, serialized[index] || '')
+  }
+  for (let index = current.filters.length; index < serialized.length; index += 1) {
+    const latest = parseGroups(next)[target.index]
+    if (!latest) return
+    next = setGroupFilter(next, latest, latest.filters.length, serialized[index]!)
+  }
+  const latest = parseGroups(next)[target.index]
+  if (!latest) return
+  const policy = groupPolicy.value === 'fixed' ? `fixed(${groupFixedIndex.value})` : groupPolicy.value
+  content.value = setGroupPolicy(next, latest, policy)
+  groupEditVisible.value = false
+  groupTarget.value = null
 }
 </script>
 
 <template>
-  <NCard title="分组" class="panel-card">
+  <NCard title="分组" class="panel-card" data-testid="groups-card">
     <template #header-extra>
-      <NTag size="small" :bordered="false">{{ groups.length }} 个</NTag>
+      <NSpace size="small" align="center">
+        <NTag size="small" :bordered="false">{{ groups.length }} 个</NTag>
+        <NButton size="small" quaternary @click="sourceVisible = true">
+          <template #icon><NIcon><CreateOutline /></NIcon></template>编辑原文
+        </NButton>
+      </NSpace>
     </template>
-    <div v-if="groups.length === 0" class="orchestrate-empty">
+    <div class="orchestrate-add inset" data-testid="group-add">
+      <NInputGroup>
+        <NInput v-model:value="newGroupName" placeholder="新分组名，如 proxy" @keyup.enter="createGroup" />
+        <NSelect v-model:value="newGroupPolicy" :options="POLICY_OPTIONS" class="group-policy-select" />
+        <NButton type="primary" ghost @click="createGroup">
+          <template #icon><NIcon><AddOutline /></NIcon></template>新建
+        </NButton>
+      </NInputGroup>
+    </div>
+    <div v-if="groups.length === 0" class="orchestrate-empty" data-testid="group-list">
       <NText depth="3">还没有分组。分组是路由规则的出站目标，按策略从命中的节点中选择。</NText>
     </div>
-    <div v-for="(group, groupIndex) in groups" :key="groupIndex" class="group-item">
+    <div v-for="(group, groupIndex) in groups" :key="groupIndex" class="group-item" data-testid="group-list">
       <div class="group-head">
         <code>{{ group.name }}</code>
-        <NPopconfirm positive-text="删除" negative-text="取消" @positive-click="content = removeGroup(content, group)">
-          <template #trigger>
-            <NButton size="tiny" quaternary type="error" title="删除分组">
-              <template #icon><NIcon><TrashOutline /></NIcon></template>
-            </NButton>
-          </template>
-          删除分组后，引用它的路由规则会校验失败，确认删除？
-        </NPopconfirm>
+        <NSpace size="small">
+          <NButton size="tiny" secondary @click="openGroupEditor(groupIndex)">
+            <template #icon><NIcon><CreateOutline /></NIcon></template>编辑
+          </NButton>
+          <NPopconfirm positive-text="删除" negative-text="取消" @positive-click="content = removeGroup(content, group)">
+            <template #trigger>
+              <NButton size="tiny" quaternary type="error" title="删除分组">
+                <template #icon><NIcon><TrashOutline /></NIcon></template>
+              </NButton>
+            </template>
+            删除分组后，引用它的路由规则会校验失败，确认删除？
+          </NPopconfirm>
+        </NSpace>
       </div>
       <div class="group-row">
         <NText depth="3">策略</NText>
@@ -170,71 +269,114 @@ function applyNodePicker() {
                 :closable="filter.editable"
                 @close="content = setGroupFilter(content, group, index, '')"
               >
-                <span class="filter-value" @click="filter.editable && openFilterEditor(group, index)">{{ filter.value }}</span>
+                <span class="filter-value" :title="filter.value" @click="filter.editable && openGroupEditor(groupIndex)">
+                  {{ describeGroupFilter(filter.value) }}
+                </span>
               </NTag>
             </template>
-            该条件跨行或结构复杂，为避免改坏配置，请在配置管理页编辑原文。
+            该条件跨行或结构复杂，请使用卡片右上角的原文编辑。
           </NTooltip>
-          <NButton size="tiny" dashed @click="openFilterEditor(group, group.filters.length)">
+          <NButton size="tiny" dashed @click="openGroupEditor(groupIndex)">
             <template #icon><NIcon><AddOutline /></NIcon></template>
-            {{ group.filters.length === 0 ? '全部节点，添加过滤' : '添加' }}
+            {{ group.filters.length === 0 ? '全部节点，选择成员' : '编辑成员' }}
           </NButton>
         </NSpace>
       </div>
     </div>
-    <div class="orchestrate-add borderless">
-      <NInputGroup>
-        <NInput v-model:value="newGroupName" placeholder="新分组名，如 proxy" @keyup.enter="createGroup" />
-        <NSelect v-model:value="newGroupPolicy" :options="POLICY_OPTIONS" class="group-policy-select" />
-        <NButton type="primary" ghost @click="createGroup">
-          <template #icon><NIcon><AddOutline /></NIcon></template>新建
-        </NButton>
-      </NInputGroup>
-    </div>
   </NCard>
 
-  <NModal :show="filterTarget !== null" preset="card" title="分组过滤条件" class="orchestrate-modal" @update:show="filterTarget = null">
-    <NText depth="3">
-      过滤函数可用 <code>&amp;&amp;</code> 连接、<code>!</code> 取反：<code>name(keyword: HK)</code>、
-      <code>name(regex: '^US')</code>、<code>subtag(my_sub)</code>。多条过滤之间是“或”关系。
-    </NText>
-    <NInput
-      v-model:value="filterValue"
-      class="mono"
-      placeholder="subtag(my_sub) && !name(keyword: '到期')"
-      spellcheck="false"
-      @keyup.enter="applyFilter()"
-    />
-    <div class="filter-actions">
-      <NButton size="tiny" type="primary" ghost @click="openNodePicker">
-        从现有节点中选择
-      </NButton>
+  <NModal v-model:show="groupEditVisible" preset="card" title="编辑分组" class="orchestrate-group-modal" :mask-closable="false" data-testid="group-editor-modal">
+    <NAlert type="info" :bordered="false">
+      可直接选择本地节点或订阅；多条过滤之间是“或”关系。订阅内部节点由 dae 拉取，面板按订阅整体加入。
+    </NAlert>
+    <div class="group-editor-policy">
+      <NText depth="3">策略</NText>
+      <NSelect v-model:value="groupPolicy" :options="POLICY_OPTIONS" />
+      <NInputNumber v-if="groupPolicy === 'fixed'" v-model:value="groupFixedIndex" :min="0" />
+    </div>
+    <div class="group-filter-editor">
+      <div class="group-filter-editor-head">
+        <div>
+          <strong>分组成员</strong>
+          <NText depth="3" class="group-resource-hint">
+            没有标签或链接名称的本地节点需先打标签；未打标签的订阅也无法由 subtag 稳定引用。
+          </NText>
+        </div>
+        <NSpace size="small" class="group-filter-actions">
+          <NButton size="small" dashed :disabled="nodeOptions.length === 0" @click="addFilter('nodes')">
+            <template #icon><NIcon><AddOutline /></NIcon></template>选择节点
+          </NButton>
+          <NButton size="small" dashed :disabled="subscriptionOptions.length === 0" @click="addFilter('subscriptions')">
+            <template #icon><NIcon><AddOutline /></NIcon></template>选择订阅
+          </NButton>
+          <NButton size="small" quaternary @click="addFilter('nameKeyword')">
+            <template #icon><NIcon><AddOutline /></NIcon></template>高级条件
+          </NButton>
+        </NSpace>
+      </div>
+      <NText v-if="groupFilters.length === 0" depth="3">不设置过滤时，该分组包含全部节点。</NText>
+      <div v-for="(filter, index) in groupFilters" :key="index" class="group-filter-editor-row">
+        <NSelect v-model:value="filter.kind" :options="FILTER_KIND_OPTIONS" />
+        <NSelect
+          v-if="filter.kind === 'nodes'"
+          v-model:value="filter.values"
+          :options="nodeOptions"
+          :render-label="renderResourceLabel"
+          multiple
+          filterable
+          tag
+          clearable
+          max-tag-count="responsive"
+          :virtual-scroll="false"
+          :consistent-menu-width="false"
+          placeholder="选择本地节点"
+          data-testid="group-node-picker"
+        />
+        <NSelect
+          v-else-if="filter.kind === 'subscriptions'"
+          v-model:value="filter.values"
+          :options="subscriptionOptions"
+          :render-label="renderResourceLabel"
+          multiple
+          filterable
+          tag
+          clearable
+          max-tag-count="responsive"
+          :virtual-scroll="false"
+          :consistent-menu-width="false"
+          placeholder="选择订阅"
+          data-testid="group-subscription-picker"
+        />
+        <NInput
+          v-else
+          v-model:value="filter.value"
+          class="mono"
+          :placeholder="filter.kind === 'raw' ? 'subtag(my_sub) && !name(keyword: 过期)' : '匹配内容'"
+          spellcheck="false"
+        />
+        <label v-if="filter.kind !== 'raw'" class="filter-exclude">
+          <NSwitch v-model:value="filter.exclude" size="small" />
+          <span>排除</span>
+        </label>
+        <span v-else class="filter-exclude-placeholder"></span>
+        <NButton quaternary circle type="error" title="删除条件" @click="groupFilters.splice(index, 1)">
+          <template #icon><NIcon><TrashOutline /></NIcon></template>
+        </NButton>
+      </div>
     </div>
     <template #footer>
       <NSpace justify="end">
-        <NButton @click="filterTarget = null">取消</NButton>
-        <NButton type="primary" @click="applyFilter()">确定</NButton>
+        <NButton @click="groupEditVisible = false">取消</NButton>
+        <NButton type="primary" @click="applyGroupEdit">应用到编排</NButton>
       </NSpace>
     </template>
   </NModal>
 
-  <NModal :show="nodePickerVisible" preset="card" title="选择节点" class="orchestrate-modal" @update:show="nodePickerVisible = false">
-    <NCheckboxGroup v-model:value="selectedNodeNames">
-      <NSpace vertical size="small">
-      <NCheckbox v-for="name in allNodeNames" :key="name" :value="name" :label="name" />
-      </NSpace>
-    </NCheckboxGroup>
-    <template #footer>
-      <NSpace justify="end">
-        <NButton @click="nodePickerVisible = false">取消</NButton>
-        <NButton type="primary" @click="applyNodePicker()">添加</NButton>
-      </NSpace>
-    </template>
-  </NModal>
+  <SectionEditorModal
+    v-model:show="sourceVisible"
+    v-model:content="content"
+    section="group"
+    title="编辑分组原文"
+    description="这里只替换 group 节内部内容，适合处理跨行条件或分组级高级参数。其他配置保持不变。"
+  />
 </template>
-
-<style scoped>
-.filter-actions {
-  margin-top: 8px;
-}
-</style>

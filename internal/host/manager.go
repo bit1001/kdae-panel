@@ -68,6 +68,10 @@ const (
 	ActionStart   Action = "start"
 	ActionStop    Action = "stop"
 	ActionRestart Action = "restart"
+	// Enable/Disable 只供 dae 卸载事务维护原有的开机启动状态；
+	// 对外的服务控制 API 仍只开放 start/stop/restart。
+	ActionEnable  Action = "enable"
+	ActionDisable Action = "disable"
 	// ActionDaemonReload 让 systemd 重新读取单元文件。首次安装写入 dae.service
 	// 之后必须执行它，否则 systemd 看不到新单元。它不作用于具体服务，
 	// 因此不接受服务名参数。
@@ -199,7 +203,7 @@ func parseExecStartPath(value string) string {
 
 func (m *systemdManager) Action(ctx context.Context, action Action) error {
 	switch action {
-	case ActionStart, ActionStop, ActionRestart:
+	case ActionStart, ActionStop, ActionRestart, ActionEnable, ActionDisable:
 	case ActionDaemonReload:
 		// daemon-reload 是全局动作，不带服务名。
 		result, err := m.runFor(ctx, actionTimeout, m.systemctl, "daemon-reload")

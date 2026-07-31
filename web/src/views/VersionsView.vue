@@ -1,9 +1,11 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, type VNode } from 'vue'
+import { useRouter } from 'vue-router'
 import {
   NAlert,
   NButton,
   NCard,
+  NCheckbox,
   NDataTable,
   NIcon,
   NRadioButton,
@@ -20,23 +22,26 @@ import {
   CloudDownloadOutline,
   RefreshOutline,
   ReturnUpBackOutline,
+  SwapHorizontalOutline,
+  TrashOutline,
 } from '@vicons/ionicons5'
-import { APIError, getJSON, postJSON } from '../api/client'
+import { APIError, deleteJSON, getJSON, postJSON } from '../api/client'
 import type {
   InstallJob,
   InstallProvision,
   InstallStatus,
+  GitHubCredentialStatus,
   UpstreamSource,
   UpstreamVersion,
 } from '../types/api'
-import { formatDateTime } from '../utils/format'
+import { formatBytes, formatDateTime } from '../utils/format'
 import { useJobPolling } from '../composables/useJobPolling'
 import { SOURCES } from '../components/versions/sources'
 import InstallStatusCard from '../components/versions/InstallStatusCard.vue'
-import GeoCard from '../components/versions/GeoCard.vue'
 
 const message = useMessage()
 const dialog = useDialog()
+const router = useRouter()
 const loading = ref(true)
 const listing = ref(false)
 // loading 只在首屏为真，之后再也不会回到 true，因此它挡不住刷新按钮被连点。
@@ -49,6 +54,8 @@ const versions = ref<UpstreamVersion[]>([])
 const source = ref<UpstreamSource>('official')
 const loadError = ref('')
 const listError = ref('')
+const cacheDeleting = ref('')
+const githubStatus = ref<GitHubCredentialStatus | null>(null)
 
 let unmounted = false
 
@@ -56,7 +63,10 @@ const installPolling = useJobPolling({
   refresh: () => loadStatus(),
   phase: () => job.value?.phase,
   onSettled: (phase) => {
-    if (phase === 'done') message.success('已完成')
+    if (phase === 'done') {
+      message.success('已完成')
+      void loadVersions()
+    }
     else if (phase === 'failed') message.error(job.value?.error || '安装失败')
   },
 })
@@ -64,6 +74,23 @@ const installPolling = useJobPolling({
 const activeSource = computed(() => SOURCES.find((item) => item.value === source.value)!)
 const busy = computed(() => job.value?.phase === 'downloading' || job.value?.phase === 'applying')
 const installedRef = computed(() => status.value?.managed?.ref || '')
+const showGitHubNotice = computed(() =>
+  githubStatus.value?.configured === false || listError.value.includes('GitHub 接口调用频率已达上限'))
+function isInstalled(version: UpstreamVersion): boolean {
+  return version.ref === installedRef.value && version.source === status.value?.managed?.source
+}
+
+function versionKey(version: UpstreamVersion): string {
+  return `${version.source}:${version.ref}`
+}
+const canUninstall = computed(() => status.value?.ready === true && status.value.managed !== undefined && !status.value.drifted)
+const uninstallHint = computed(() => {
+  if (status.value?.drifted) return 'dae 已在面板之外被替换，请先重装一个版本后再卸载'
+  if (!status.value?.managed) return '当前 dae 没有面板安装记录，为避免误删外部安装，不能自动卸载'
+  return ''
+})
+const purgeConfig = ref(false)
+const purgeGeo = ref(false)
 
 async function loadStatus() {
   try {
@@ -118,6 +145,15 @@ async function loadVersions() {
   }
 }
 
+async function loadGitHubStatus() {
+  try {
+    const payload = await getJSON<{ status: GitHubCredentialStatus }>('/api/v1/settings/github')
+    if (!unmounted) githubStatus.value = payload.status
+  } catch {
+    // 凭据状态只是辅助提示；版本列表本身的错误仍由 loadVersions 如实显示。
+  }
+}
+
 function changeSource(next: UpstreamSource) {
   if (next === source.value) return
   source.value = next
@@ -160,11 +196,14 @@ async function confirmInstall(version: UpstreamVersion) {
     })
     return
   }
+  const local = version.cached === true
   dialog.warning({
     title: `安装 ${version.label}`,
-    content: '面板会下载并校验该版本，用它验证当前配置，然后替换二进制并重启 dae。'
+    content: (local
+      ? '面板会读取并重新校验本地版本，用它验证当前配置，然后替换二进制并重启 dae。'
+      : '面板会下载并校验该版本，用它验证当前配置，然后替换二进制并重启 dae。')
       + '重启会中断现有连接；若新版本起不来，会自动回滚到当前版本。',
-    positiveText: '下载并安装',
+    positiveText: local ? '使用本地版本' : '下载并安装',
     negativeText: '取消',
     onPositiveClick: () => install(version),
   })
@@ -178,7 +217,7 @@ async function install(version: UpstreamVersion) {
       label: version.label,
     })
     job.value = payload.job
-    message.info('已开始安装，可以留在本页查看进度')
+    message.info(version.cached && !firstInstall.value ? '已开始使用本地版本切换' : '已开始下载安装')
     installPolling.start()
   } catch (error) {
     message.error(error instanceof Error ? error.message : '启动安装失败')
@@ -187,6 +226,33 @@ async function install(version: UpstreamVersion) {
       await loadStatus()
       if (busy.value) installPolling.start()
     }
+  }
+}
+
+function confirmDeleteCached(version: UpstreamVersion) {
+  const current = isInstalled(version)
+  const size = formatBytes(version.cachedBytes)
+  dialog.warning({
+    title: `删除本地版本 ${version.label}`,
+    content: `将删除这份 ${size} 的本地缓存。`
+      + (current ? '当前运行中的 dae 不受影响；以后再次安装该版本需要重新下载。' : '当前运行文件和回滚点不受影响。'),
+    positiveText: '删除缓存',
+    negativeText: '取消',
+    onPositiveClick: () => deleteCached(version),
+  })
+}
+
+async function deleteCached(version: UpstreamVersion) {
+  const key = versionKey(version)
+  cacheDeleting.value = key
+  try {
+    await deleteJSON<void>('/api/v1/dae/cache', { source: version.source, ref: version.ref })
+    message.success(`已删除 ${version.label} 的本地缓存`)
+    await loadVersions()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '删除本地版本失败')
+  } finally {
+    cacheDeleting.value = ''
   }
 }
 
@@ -215,6 +281,57 @@ async function rollback() {
   }
 }
 
+async function confirmUninstall() {
+  // 卸载是破坏性操作，确认框必须依据点击当下的状态，而不是首屏快照。
+  await loadStatus()
+  if (unmounted) return
+  if (!canUninstall.value) {
+    message.warning(uninstallHint.value || '当前 dae 无法由面板卸载')
+    return
+  }
+  purgeConfig.value = false
+  purgeGeo.value = false
+  dialog.warning({
+    title: '卸载 dae',
+    content: () => h(NSpace, { vertical: true, size: 12 }, {
+      default: () => [
+        h(NText, null, {
+          default: () => '这会停止 dae，现有代理连接会立即中断，并删除由面板管理的可执行文件、systemd 服务单元和版本回滚记录。',
+        }),
+        h(NCheckbox, {
+          checked: purgeConfig.value,
+          'onUpdate:checked': (value: boolean) => { purgeConfig.value = value },
+        }, { default: () => '同时删除 dae 主配置文件' }),
+        h(NCheckbox, {
+          checked: purgeGeo.value,
+          'onUpdate:checked': (value: boolean) => { purgeGeo.value = value },
+        }, { default: () => '同时删除面板可见的全部 geo 数据副本' }),
+        h(NText, { depth: 3 }, {
+          default: () => '未勾选的数据会保留，之后可在本页重新安装。面板沙箱看不到的 /root/.local/share/dae 不会被删除。',
+        }),
+      ],
+    }),
+    positiveText: '停止并卸载',
+    negativeText: '取消',
+    onPositiveClick: () => uninstall({ purgeConfig: purgeConfig.value, purgeGeo: purgeGeo.value }),
+  })
+}
+
+async function uninstall(options: { purgeConfig: boolean; purgeGeo: boolean }) {
+  try {
+    const payload = await postJSON<{ job: InstallJob }>('/api/v1/dae/uninstall', options)
+    job.value = payload.job
+    message.info('已开始卸载 dae')
+    installPolling.start()
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '启动卸载失败')
+    if (error instanceof APIError && error.status === 409) {
+      await loadStatus()
+      if (busy.value) installPolling.start()
+    }
+  }
+}
+
 const columns = computed<DataTableColumns<UpstreamVersion>>(() => [
   {
     title: '版本',
@@ -223,8 +340,14 @@ const columns = computed<DataTableColumns<UpstreamVersion>>(() => [
     render: (row) => h(NSpace, { size: 4, align: 'center', wrap: false }, {
       default: () => [
         h('span', { class: 'mono version-label' }, row.label),
-        row.ref === installedRef.value
+        isInstalled(row)
           ? h(NTag, { size: 'tiny', type: 'success', bordered: false }, { default: () => '当前' })
+          : null,
+        row.cached
+          ? h(NTooltip, null, {
+              trigger: () => h(NTag, { size: 'tiny', type: 'info', bordered: false }, { default: () => '已下载' }),
+              default: () => `本地缓存 ${formatBytes(row.cachedBytes)} · ${formatDateTime(row.cachedAt)}`,
+            })
           : null,
         row.prerelease
           ? h(NTag, { size: 'tiny', type: 'warning', bordered: false }, { default: () => '预发布' })
@@ -264,7 +387,7 @@ const columns = computed<DataTableColumns<UpstreamVersion>>(() => [
   {
     title: '操作',
     key: 'actions',
-    width: 110,
+    width: 158,
     fixed: 'right',
     render: (row) => {
       if (!row.installable) {
@@ -273,25 +396,44 @@ const columns = computed<DataTableColumns<UpstreamVersion>>(() => [
           default: () => row.note || '该版本无法安装',
         })
       }
+      const actions: VNode[] = []
       // 磁盘被外部替换过时，"已安装"这条也要能重装回来修复漂移
-      if (row.ref === installedRef.value && !status.value?.drifted) {
-        return h(NText, { depth: 3 }, { default: () => '已安装' })
+      if (isInstalled(row) && !status.value?.drifted) {
+        actions.push(h(NText, { depth: 3 }, { default: () => '已安装' }))
+      } else {
+        const local = row.cached && !firstInstall.value
+        actions.push(h(NButton, {
+          size: 'small',
+          secondary: true,
+          type: 'primary',
+          disabled: busy.value || !(status.value?.ready || firstInstall.value),
+          onClick: () => void confirmInstall(row),
+        }, {
+          icon: () => h(NIcon, null, { default: () => h(local ? SwapHorizontalOutline : CloudDownloadOutline) }),
+          default: () => firstInstall.value ? '安装' : '切换',
+        }))
       }
-      return h(NButton, {
-        size: 'small',
-        secondary: true,
-        type: 'primary',
-        disabled: busy.value || !(status.value?.ready || firstInstall.value),
-        onClick: () => void confirmInstall(row),
-      }, {
-        icon: () => h(NIcon, null, { default: () => h(CloudDownloadOutline) }),
-        default: () => firstInstall.value ? '安装' : '切换',
-      })
+      if (row.cached) {
+        actions.push(h(NTooltip, null, {
+          trigger: () => h(NButton, {
+            size: 'small',
+            quaternary: true,
+            type: 'error',
+            'aria-label': `删除 ${row.label} 的本地缓存`,
+            loading: cacheDeleting.value === versionKey(row),
+            disabled: busy.value || cacheDeleting.value !== '',
+            onClick: () => confirmDeleteCached(row),
+          }, { icon: () => h(NIcon, null, { default: () => h(TrashOutline) }) }),
+          default: () => isInstalled(row) ? '删除缓存，不影响当前运行' : '删除本地缓存',
+        }))
+      }
+      return h(NSpace, { size: 4, align: 'center', wrap: false }, { default: () => actions })
     },
   },
 ])
 
 onMounted(async () => {
+  void loadGitHubStatus()
   await loadStatus()
   if (unmounted) return
   await loadVersions()
@@ -328,6 +470,16 @@ onBeforeUnmount(() => {
         >
           <template #icon><NIcon><ReturnUpBackOutline /></NIcon></template>回滚上一版
         </NButton>
+        <NTooltip v-if="status?.ready" :disabled="canUninstall">
+          <template #trigger>
+            <span>
+              <NButton type="error" secondary :disabled="busy || !canUninstall" @click="confirmUninstall">
+                <template #icon><NIcon><TrashOutline /></NIcon></template>卸载 dae
+              </NButton>
+            </span>
+          </template>
+          {{ uninstallHint }}
+        </NTooltip>
       </NSpace>
     </div>
 
@@ -337,17 +489,25 @@ onBeforeUnmount(() => {
     <NAlert v-else-if="loadError" type="error" :bordered="false">{{ loadError }}</NAlert>
 
     <template v-if="!disabled">
+      <NAlert v-if="showGitHubNotice" type="warning" :bordered="false">
+        <div class="github-token-notice">
+          <span>当前使用 GitHub 匿名 API；共享出口或频繁刷新可能达到每小时 60 次限制，并影响版本列表与新版本安装。</span>
+          <NButton size="small" secondary @click="router.push({ name: 'settings' })">去设置 Token</NButton>
+        </div>
+      </NAlert>
       <NAlert v-if="job?.phase === 'downloading'" type="info" :bordered="false">
         正在下载并校验 {{ job.label || job.ref }}…
       </NAlert>
       <NAlert v-else-if="job?.phase === 'applying'" type="warning" :bordered="false">
-        正在替换二进制并重启 dae，期间连接会短暂中断…
+        <template v-if="job.label === '卸载 dae'">正在停止服务并卸载 dae，数据将按确认时的选择处理…</template>
+        <template v-else-if="job.cached">正在使用本地版本替换二进制并重启 dae，期间连接会短暂中断…</template>
+        <template v-else>正在替换二进制并重启 dae，期间连接会短暂中断…</template>
       </NAlert>
       <NAlert v-else-if="job?.phase === 'failed'" type="error" :bordered="false">
         上次操作失败：{{ job.error }}
       </NAlert>
 
-      <InstallStatusCard :loading="loading" :status="status" :provision="provision" />
+      <InstallStatusCard :loading="loading" :busy="busy" :status="status" :provision="provision" />
 
       <NCard class="panel-card" content-style="padding: 0;">
         <template #header>
@@ -366,7 +526,7 @@ onBeforeUnmount(() => {
           :data="versions"
           :loading="listing"
           :row-key="(row: UpstreamVersion) => row.ref"
-          :scroll-x="720"
+          :scroll-x="820"
           :bordered="false"
           size="small"
         >
@@ -379,8 +539,5 @@ onBeforeUnmount(() => {
       </NCard>
     </template>
 
-    <!-- geo 数据是独立开关，因此不放在 dae 版本管理的 v-if 里：
-         只开其中一个的部署是正常情况 -->
-    <GeoCard />
   </div>
 </template>

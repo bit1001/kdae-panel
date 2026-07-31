@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   addGroup,
+  addRoutingRule,
   appendToSection,
   findSection,
   isQuotable,
@@ -11,12 +12,16 @@ import {
   parseRoutingRules,
   parseSection,
   quote,
+  readSectionBody,
   removeGroup,
   removeLine,
+  removeRoutingRule,
   replaceLine,
   scanSections,
   setGroupFilter,
   setGroupPolicy,
+  setRoutingRule,
+  setSectionBody,
   unquote,
 } from './daeconf'
 
@@ -172,18 +177,80 @@ describe('parseRoutingRules', () => {
   it('解析规则与 fallback,忽略行尾注释', () => {
     const rules = parseRoutingRules(SAMPLE)
     expect(rules).toHaveLength(4)
-    expect(rules[0]).toEqual({ match: 'pname(NetworkManager)', outbound: 'direct', isFallback: false })
+    expect(rules[0]).toMatchObject({
+      match: 'pname(NetworkManager)',
+      outbound: 'direct',
+      isFallback: false,
+      editable: true,
+    })
+    expect(rules[0].lineStart).toBeLessThan(rules[0].lineEnd)
     expect(rules[2].match).toBe('domain(geosite:cn)')
-    expect(rules[3]).toEqual({ match: 'fallback', outbound: 'proxy', isFallback: true })
+    expect(rules[3]).toMatchObject({ match: 'fallback', outbound: 'proxy', isFallback: true, editable: true })
   })
 
   it('参数字符串里的 -> 不会切分规则', () => {
     const text = "routing {\n  domain(full: 'weird->name')\n    -> proxy\n  fallback: direct\n}\n"
-    expect(parseRoutingRules(text)[0]).toEqual({
+    expect(parseRoutingRules(text)[0]).toMatchObject({
       match: "domain(full: 'weird->name')",
       outbound: 'proxy',
       isFallback: false,
+      editable: false,
     })
+  })
+})
+
+describe('路由规则改写', () => {
+  it('原位替换规则并保留行尾注释', () => {
+    const text = 'routing {\n  domain(geosite:gfw) -> proxy # 主规则\n  fallback: direct\n}\n'
+    const rule = parseRoutingRules(text)[0]
+    const next = setRoutingRule(text, rule, 'dport(443)', 'block')
+    expect(next).toBe('routing {\n  dport(443) -> block # 主规则\n  fallback: direct\n}\n')
+  })
+
+  it('规则可在普通匹配与 fallback 之间转换', () => {
+    const text = 'routing {\n  domain(geosite:gfw) -> proxy\n}\n'
+    const fallback = setRoutingRule(text, parseRoutingRules(text)[0], 'fallback', 'direct', true)
+    expect(fallback).toBe('routing {\n  fallback: direct\n}\n')
+    const ordinary = setRoutingRule(fallback, parseRoutingRules(fallback)[0], 'domain(geosite:cn)', 'proxy', false)
+    expect(ordinary).toBe('routing {\n  domain(geosite:cn) -> proxy\n}\n')
+  })
+
+  it('删除只移除目标规则', () => {
+    const text = 'routing {\n  domain(geosite:gfw) -> proxy\n  fallback: direct\n}\n'
+    const next = removeRoutingRule(text, parseRoutingRules(text)[0])
+    expect(next).toBe('routing {\n  fallback: direct\n}\n')
+  })
+
+  it('新增普通规则插在 fallback 前', () => {
+    const text = 'routing {\n  fallback: direct\n}\n'
+    const next = addRoutingRule(text, 'domain(geosite:gfw)', 'proxy')
+    expect(next).toBe('routing {\n  domain(geosite:gfw) -> proxy\n  fallback: direct\n}\n')
+  })
+
+  it('跨行规则只展示，不允许定点改写或删除', () => {
+    const text = "routing {\n  domain(full: 'example.com')\n    -> proxy\n  fallback: direct\n}\n"
+    const rule = parseRoutingRules(text)[0]
+    expect(rule.editable).toBe(false)
+    expect(setRoutingRule(text, rule, 'domain(geosite:gfw)', 'direct')).toBe(text)
+    expect(removeRoutingRule(text, rule)).toBe(text)
+  })
+})
+
+describe('节原文编辑', () => {
+  it('读取和替换目标节，不改动其他节', () => {
+    const text = 'global {\n  log_level: info\n}\nrouting {\n  fallback: direct\n}\nnode {\n  a: ss://x\n}\n'
+    expect(readSectionBody(text, 'routing')).toBe('  fallback: direct')
+    const next = setSectionBody(text, 'routing', '  domain(geosite:gfw) -> proxy\n  fallback: direct')
+    expect(next).toBe(
+      'global {\n  log_level: info\n}\nrouting {\n  domain(geosite:gfw) -> proxy\n  fallback: direct\n}\nnode {\n  a: ss://x\n}\n',
+    )
+  })
+
+  it('节缺失时创建，并沿用 CRLF', () => {
+    const text = 'global {\r\n}\r\n'
+    const next = setSectionBody(text, 'routing', '  fallback: direct\n')
+    expect(next).toBe('global {\r\n}\r\nrouting {\r\n  fallback: direct\r\n}\r\n')
+    expect(next).not.toMatch(/[^\r]\n/)
   })
 })
 

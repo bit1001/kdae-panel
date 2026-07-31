@@ -22,6 +22,7 @@ import {
 import { APIError, getJSON, postJSON, putJSON } from '../api/client'
 import type { ConfigDocument, ConfigSaveResult } from '../types/api'
 import { readSection } from '../utils/daeconf'
+import GlobalCard from '../components/orchestration/GlobalCard.vue'
 import NodesCard from '../components/orchestration/NodesCard.vue'
 import SubscriptionsCard from '../components/orchestration/SubscriptionsCard.vue'
 import GroupsCard from '../components/orchestration/GroupsCard.vue'
@@ -43,7 +44,8 @@ const validationError = ref('')
 
 const dirty = computed(() => content.value !== originalContent.value)
 const unparsedLines = computed(
-  () => readSection(content.value, 'node').unparsedLines
+  () => readSection(content.value, 'global').unparsedLines
+    + readSection(content.value, 'node').unparsedLines
     + readSection(content.value, 'subscription').unparsedLines,
 )
 
@@ -152,8 +154,8 @@ onMounted(() => void load())
   <div class="page-stack orchestrate-page">
     <div class="page-toolbar">
       <div>
-        <h2>节点、订阅与分组</h2>
-        <NText depth="3">对配置做结构化编排，注释与未涉及的节保持原样，保存时整体经 dae 校验</NText>
+        <h2>代理编排</h2>
+        <NText depth="3">可视化编辑全局设置、节点、订阅、分组与路由，未涉及的配置和注释保持原样</NText>
       </div>
       <NSpace>
         <NButton secondary :disabled="loading" @click="load">
@@ -180,12 +182,13 @@ onMounted(() => void load())
       有未保存的编排修改，保存并重载后才会应用到 dae。
     </NAlert>
     <NAlert v-if="unparsedLines > 0" type="info" :bordered="false">
-      节点与订阅中有 {{ unparsedLines }} 行采用了跨行或多条目写法，未在下方列出。
-      它们仍然生效，请在配置管理页查看和编辑原文。
+      配置中有 {{ unparsedLines }} 行采用了跨行或多条目写法，未在下方列出。
+      它们仍然生效，可使用对应卡片右上角的原文编辑处理。
     </NAlert>
 
     <NSpin :show="loading">
       <div class="page-stack">
+        <GlobalCard v-model="content" />
         <NodesCard v-model="content" />
 
         <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
@@ -197,7 +200,7 @@ onMounted(() => void load())
           </NGridItem>
         </NGrid>
 
-        <RoutingCard :content="content" />
+        <RoutingCard v-model="content" />
       </div>
     </NSpin>
   </div>

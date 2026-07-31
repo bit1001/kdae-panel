@@ -11,7 +11,7 @@ export const SOURCES: { value: UpstreamSource; label: string; hint: string }[] =
     value: 'kdae',
     label: 'kdae 分支',
     hint: 'olicesx/dae 的 kdae 分支没有正式发布，这里列出的是每一次成功的 CI 构建。'
-      + '构建产物保留 90 天，过期后无法安装；校验和取自 GitHub Actions 接口。',
+      + '构建产物保留 90 天；已下载的本地版本不受过期影响，校验和取自 GitHub Actions 接口。',
   },
 ]
 

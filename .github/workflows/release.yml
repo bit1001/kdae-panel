@@ -70,3 +70,10 @@ jobs:
     uses: ./.github/workflows/release-smoke.yml
     with:
       version: ${{ github.ref_name }}
+
+  # 正式版的全部装机验证通过后，RC 已完成使命；同时删除 Release 与 tag，
+  # 避免版本列表持续堆积。预发布自身不会触发这一步。
+  cleanup-prereleases:
+    needs: smoke
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/cleanup-prereleases.yml
