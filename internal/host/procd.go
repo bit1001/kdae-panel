@@ -52,9 +52,15 @@ func (m *procdManager) Status(ctx context.Context) (Status, error) {
 		ActiveState: "active",
 		SubState:    "running",
 		MainPID:     pid,
+		UnitPath:    filepath.Join(initDir, m.serviceName),
 	}
 	if mem := readProcField(pid, "VmRSS:"); mem != "" {
 		status.MemoryBytes = parseMemoryKB(mem)
+	}
+	if tasks := readProcField(pid, "Threads:"); tasks != "" {
+		if t, err := strconv.ParseUint(strings.TrimSpace(tasks), 10, 64); err == nil {
+			status.Tasks = t
+		}
 	}
 	if cmdline := readProcCmdline(pid); cmdline != "" {
 		status.ExecStartPath = cmdline
@@ -67,7 +73,7 @@ func (m *procdManager) Status(ctx context.Context) (Status, error) {
 
 func (m *procdManager) Action(ctx context.Context, action Action) error {
 	switch action {
-	case ActionStart, ActionStop, ActionRestart:
+	case ActionStart, ActionStop, ActionRestart, ActionEnable, ActionDisable:
 	case ActionDaemonReload:
 		return nil
 	default:
@@ -165,15 +171,24 @@ func readProcCPUTime(pid int) uint64 {
 	if err != nil {
 		return 0
 	}
-	fields := strings.Fields(string(content))
-	if len(fields) < 15 {
+	raw := string(content)
+	// /proc/pid/stat 格式: pid (comm) state ...  comm 可能含空格/括号，
+	// 用 strings.Fields 会错位。找到最后一个 ')' 跳过 comm。
+	rp := strings.LastIndex(raw, ") ")
+	if rp < 0 {
 		return 0
 	}
-	utime, err := strconv.ParseUint(fields[13], 10, 64)
+	after := raw[rp+2:]
+	fields := strings.Fields(after)
+	// field 0=state, 1=ppid, 2=pgrp, ... 11=utime, 12=stime
+	if len(fields) < 13 {
+		return 0
+	}
+	utime, err := strconv.ParseUint(fields[11], 10, 64)
 	if err != nil {
 		return 0
 	}
-	stime, err := strconv.ParseUint(fields[14], 10, 64)
+	stime, err := strconv.ParseUint(fields[12], 10, 64)
 	if err != nil {
 		return 0
 	}
