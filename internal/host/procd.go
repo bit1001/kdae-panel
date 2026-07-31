@@ -15,8 +15,6 @@ import (
 	"github.com/tuoro/kdae-panel/internal/command"
 )
 
-const daeLogFile = "/var/log/dae/dae.log"
-
 // procdManager 通过 procd (/etc/init.d) 管理服务，适用于 OpenWrt/ImmortalWrt。
 type procdManager struct {
 	serviceName string
@@ -92,6 +90,8 @@ func (m *procdManager) RestartSelf(ctx context.Context) error {
 	return nil
 }
 
+const daeLogFile = "/var/log/dae/dae.log"
+
 func (m *procdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error) {
 	if limit <= 0 {
 		limit = 200
@@ -133,7 +133,6 @@ func readDaeLogFile(path string, limit int) []LogEntry {
 	if len(lines) == 0 {
 		return nil
 	}
-	// 取最后 limit 行
 	if len(lines) > limit {
 		lines = lines[len(lines)-limit:]
 	}
@@ -153,7 +152,6 @@ func parseDaeLogLine(line string) LogEntry {
 		Priority:  6,
 		Unit:      "dae",
 	}
-	// 解析 key=value 对
 	rest := line
 	for rest != "" {
 		rest = strings.TrimSpace(rest)
@@ -344,7 +342,7 @@ func parseLogreadLine(line, serviceName string) *LogEntry {
 	}
 	afterPID = strings.TrimSpace(afterPID)
 	entry.Message = afterPID
-	entry.Level = extractLogreadLevel(line, serviceName)
+	entry.Level = extractDaeLogLevel(afterPID)
 	return entry
 }
 
@@ -364,21 +362,30 @@ func extractLogreadTimestamp(prefix string) time.Time {
 	return time.Now().UTC()
 }
 
-func extractLogreadLevel(line, serviceName string) string {
-	prefix := serviceName + "."
-	idx := strings.Index(line, prefix)
+func extractDaeLogLevel(msg string) string {
+	// dae 日志格式：level=warning msg="..."
+	prefix := "level="
+	idx := strings.Index(msg, prefix)
 	if idx < 0 {
 		return "info"
 	}
-	rest := line[idx+len(prefix):]
+	rest := msg[idx+len(prefix):]
 	space := strings.IndexByte(rest, ' ')
 	if space < 0 {
-		return "info"
+		space = len(rest)
 	}
 	level := rest[:space]
 	switch level {
-	case "emerg", "alert", "crit", "err", "warning", "notice", "info", "debug":
-		return level
+	case "error", "err":
+		return "err"
+	case "warning", "warn":
+		return "warning"
+	case "info":
+		return "info"
+	case "debug":
+		return "debug"
+	case "fatal":
+		return "err"
 	}
 	return "info"
 }
