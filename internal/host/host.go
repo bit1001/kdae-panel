@@ -11,6 +11,7 @@ type Manager interface {
 	Action(ctx context.Context, action Action) error
 	RestartSelf(ctx context.Context) error
 	Logs(ctx context.Context, limit int) ([]LogEntry, error)
+	Interfaces(ctx context.Context) ([]NetworkInterface, error)
 }
 
 // hasProcd 检测当前系统是否使用 procd（OpenWrt/ImmortalWrt 等）。

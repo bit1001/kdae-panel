@@ -90,7 +90,9 @@ func (m *procdManager) RestartSelf(ctx context.Context) error {
 	return nil
 }
 
-const daeLogFile = "/var/log/dae/dae.log"
+func (m *procdManager) Interfaces(ctx context.Context) ([]NetworkInterface, error) {
+	return queryInterfaces(ctx)
+}
 
 func (m *procdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error) {
 	if limit <= 0 {
@@ -99,118 +101,11 @@ func (m *procdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error) 
 	if limit > maxLogLines {
 		limit = maxLogLines
 	}
-	// dae 通常写文件日志而非 syslog，优先读取日志文件。
-	if m.serviceName == "dae" {
-		if entries := readDaeLogFile(daeLogFile, limit); len(entries) > 0 {
-			return entries, nil
-		}
-	}
 	result, err := m.run(ctx, "logread", "-l", strconv.Itoa(limit))
 	if err != nil {
 		return nil, fmt.Errorf("读取 logread 日志: %s", command.Describe(err, result))
 	}
 	return parseLogread(result.Stdout, m.serviceName), nil
-}
-
-// readDaeLogFile 从 dae 日志文件读取最新的 N 行。
-// dae 日志格式为 key=value 风格，例如：
-//
-//	level=info msg="10.0.0.2:54321 <-> example.com:443" dialer=node1 ...
-func readDaeLogFile(path string, limit int) []LogEntry {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(f)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 1024*1024)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if len(lines) == 0 {
-		return nil
-	}
-	if len(lines) > limit {
-		lines = lines[len(lines)-limit:]
-	}
-
-	entries := make([]LogEntry, 0, len(lines))
-	for _, line := range lines {
-		entries = append(entries, parseDaeLogLine(line))
-	}
-	return entries
-}
-
-// parseDaeLogLine 解析单行 dae 日志。
-func parseDaeLogLine(line string) LogEntry {
-	entry := LogEntry{
-		Timestamp: time.Now().UTC(),
-		Level:     "info",
-		Priority:  6,
-		Unit:      "dae",
-	}
-	rest := line
-	for rest != "" {
-		rest = strings.TrimSpace(rest)
-		if rest == "" {
-			break
-		}
-		eq := strings.IndexByte(rest, '=')
-		if eq < 0 {
-			break
-		}
-		key := rest[:eq]
-		rest = rest[eq+1:]
-		if rest == "" {
-			break
-		}
-		var value string
-		if rest[0] == '"' {
-			end := strings.IndexByte(rest[1:], '"')
-			if end < 0 {
-				value = rest[1:]
-				rest = ""
-			} else {
-				value = rest[1 : end+1]
-				rest = rest[end+2:]
-			}
-		} else {
-			space := strings.IndexByte(rest, ' ')
-			if space < 0 {
-				value = rest
-				rest = ""
-			} else {
-				value = rest[:space]
-				rest = rest[space+1:]
-			}
-		}
-		switch key {
-		case "level":
-			entry.Level = value
-		case "msg":
-			entry.Message = value
-		case "time":
-			if ts, err := time.Parse(time.RFC3339Nano, value); err == nil {
-				entry.Timestamp = ts.UTC()
-			}
-		}
-	}
-	switch entry.Level {
-	case "error", "err":
-		entry.Priority = 3
-	case "warning", "warn":
-		entry.Priority = 4
-	case "info":
-		entry.Priority = 6
-	case "debug":
-		entry.Priority = 7
-	case "fatal":
-		entry.Priority = 2
-	}
-	return entry
 }
 
 func (m *procdManager) findPID(ctx context.Context) (int, error) {
