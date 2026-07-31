@@ -128,6 +128,13 @@ func (m *procdManager) findPID(ctx context.Context) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("解析 PID %q: %w", pidStr, err)
 	}
+	// 校验进程名是否匹配，避免 pidof 误匹配（如 busybox pidof 可能因可执行文件路径含关键字而返回无关进程）。
+	if comm, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm")); len(comm) > 0 {
+		name := strings.TrimSuffix(strings.TrimSpace(string(comm)), "\n")
+		if name != m.serviceName {
+			return 0, fmt.Errorf("PID %d 进程名 %q 与期望 %q 不匹配", pid, name, m.serviceName)
+		}
+	}
 	return pid, nil
 }
 

@@ -264,6 +264,10 @@ func (m *systemdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error
 	return parseJournal(result.Stdout)
 }
 
+func (m *systemdManager) Interfaces(ctx context.Context) ([]NetworkInterface, error) {
+	return queryInterfaces(ctx)
+}
+
 func (m *systemdManager) run(ctx context.Context, name string, args ...string) (command.Result, error) {
 	return m.runFor(ctx, m.timeout, name, args...)
 }

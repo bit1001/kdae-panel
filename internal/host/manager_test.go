@@ -13,8 +13,7 @@ import (
 )
 
 func TestInterfacesAreSorted(t *testing.T) {
-	manager := &Manager{}
-	interfaces, err := manager.Interfaces(context.Background())
+	interfaces, err := queryInterfaces(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -37,8 +36,7 @@ func TestInterfacesAreSorted(t *testing.T) {
 func TestInterfacesHonorCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	manager := &Manager{}
-	if _, err := manager.Interfaces(ctx); !errors.Is(err, context.Canceled) {
+	if _, err := queryInterfaces(ctx); !errors.Is(err, context.Canceled) {
 		t.Fatalf("错误 = %v，期望 context.Canceled", err)
 	}
 }
