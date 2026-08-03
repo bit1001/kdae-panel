@@ -7,10 +7,12 @@ import {
   NCard,
   NCheckbox,
   NDataTable,
+  NEmpty,
   NIcon,
   NRadioButton,
   NRadioGroup,
   NSpace,
+  NSpin,
   NTag,
   NText,
   NTooltip,
@@ -36,12 +38,14 @@ import type {
 } from '../types/api'
 import { formatBytes, formatDateTime } from '../utils/format'
 import { useJobPolling } from '../composables/useJobPolling'
+import { useMobileViewport } from '../composables/useMobileViewport'
 import { SOURCES } from '../components/versions/sources'
 import InstallStatusCard from '../components/versions/InstallStatusCard.vue'
 
 const message = useMessage()
 const dialog = useDialog()
 const router = useRouter()
+const mobile = useMobileViewport()
 const loading = ref(true)
 const listing = ref(false)
 // loading 只在首屏为真，之后再也不会回到 true，因此它挡不住刷新按钮被连点。
@@ -72,7 +76,8 @@ const installPolling = useJobPolling({
 })
 
 const activeSource = computed(() => SOURCES.find((item) => item.value === source.value)!)
-const busy = computed(() => job.value?.phase === 'downloading' || job.value?.phase === 'applying')
+const installBusy = computed(() => job.value?.phase === 'downloading' || job.value?.phase === 'applying')
+const busy = installBusy
 const installedRef = computed(() => status.value?.managed?.ref || '')
 const showGitHubNotice = computed(() =>
   githubStatus.value?.configured === false || listError.value.includes('GitHub 接口调用频率已达上限'))
@@ -196,17 +201,10 @@ async function confirmInstall(version: UpstreamVersion) {
     })
     return
   }
-  const local = version.cached === true
-  dialog.warning({
-    title: `安装 ${version.label}`,
-    content: (local
-      ? '面板会读取并重新校验本地版本，用它验证当前配置，然后替换二进制并重启 dae。'
-      : '面板会下载并校验该版本，用它验证当前配置，然后替换二进制并重启 dae。')
-      + '重启会中断现有连接；若新版本起不来，会自动回滚到当前版本。',
-    positiveText: local ? '使用本地版本' : '下载并安装',
-    negativeText: '取消',
-    onPositiveClick: () => install(version),
-  })
+
+  // 安装事务会在替换前用目标二进制执行版本探测和配置 validate；
+  // 直接进入事务即可完成“预检并切换”，无需先跑一份独立预检再让用户确认第二次。
+  await install(version)
 }
 
 async function install(version: UpstreamVersion) {
@@ -259,7 +257,7 @@ async function deleteCached(version: UpstreamVersion) {
 function confirmRollback() {
   dialog.warning({
     title: '回滚到上一版本',
-    content: '面板会把安装前备份的二进制换回去并重启 dae。',
+    content: '面板会把安装前备份的二进制换回去；dae 当前正在运行时会重启，未运行时则保持未运行。',
     positiveText: '回滚',
     negativeText: '取消',
     onPositiveClick: rollback,
@@ -410,7 +408,7 @@ const columns = computed<DataTableColumns<UpstreamVersion>>(() => [
           onClick: () => void confirmInstall(row),
         }, {
           icon: () => h(NIcon, null, { default: () => h(local ? SwapHorizontalOutline : CloudDownloadOutline) }),
-          default: () => firstInstall.value ? '安装' : '切换',
+          default: () => firstInstall.value ? '安装' : '预检并切换',
         }))
       }
       if (row.cached) {
@@ -439,7 +437,7 @@ onMounted(async () => {
   await loadVersions()
   if (unmounted) return
   // 任务可能在本页打开之前就已在跑，这时也要接上轮询
-  if (busy.value) installPolling.start()
+  if (installBusy.value) installPolling.start()
 })
 // 轮询的卸载清理由 useJobPolling 自己挂钩，这里只管本组件的加载链
 onBeforeUnmount(() => {
@@ -454,7 +452,7 @@ onBeforeUnmount(() => {
         <h2>dae 版本</h2>
         <NText depth="3">在官方发布与 kdae 构建之间切换，安装前校验、失败自动回滚</NText>
       </div>
-      <NSpace>
+      <NSpace class="version-toolbar-actions">
         <NButton
           secondary
           :loading="listing || loading || refreshing"
@@ -496,17 +494,19 @@ onBeforeUnmount(() => {
         </div>
       </NAlert>
       <NAlert v-if="job?.phase === 'downloading'" type="info" :bordered="false">
-        正在下载并校验 {{ job.label || job.ref }}…
+        <div class="version-download-copy">
+          <strong>正在下载并校验 {{ job.label || job.ref }}…</strong>
+          <span>首次下载速度取决于 GitHub/CDN 和服务器网络；成功后会保存为本地版本，再次切换无需下载。</span>
+        </div>
       </NAlert>
       <NAlert v-else-if="job?.phase === 'applying'" type="warning" :bordered="false">
         <template v-if="job.label === '卸载 dae'">正在停止服务并卸载 dae，数据将按确认时的选择处理…</template>
-        <template v-else-if="job.cached">正在使用本地版本替换二进制并重启 dae，期间连接会短暂中断…</template>
-        <template v-else>正在替换二进制并重启 dae，期间连接会短暂中断…</template>
+        <template v-else-if="status?.serviceActive">正在验证配置并替换二进制，随后会重启 dae，期间连接会短暂中断…</template>
+        <template v-else>正在验证配置并替换二进制；dae 当前未运行，完成后仍会保持未运行…</template>
       </NAlert>
       <NAlert v-else-if="job?.phase === 'failed'" type="error" :bordered="false">
         上次操作失败：{{ job.error }}
       </NAlert>
-
       <InstallStatusCard :loading="loading" :busy="busy" :status="status" :provision="provision" />
 
       <NCard class="panel-card" content-style="padding: 0;">
@@ -522,6 +522,7 @@ onBeforeUnmount(() => {
         </div>
         <NAlert v-if="listError" type="error" :bordered="false" class="source-hint">{{ listError }}</NAlert>
         <NDataTable
+          v-if="!mobile"
           :columns="columns"
           :data="versions"
           :loading="listing"
@@ -536,6 +537,51 @@ onBeforeUnmount(() => {
             </div>
           </template>
         </NDataTable>
+        <NSpin v-else :show="listing">
+          <div v-if="versions.length" class="mobile-record-list" data-testid="mobile-version-list">
+            <article v-for="version in versions" :key="versionKey(version)" class="mobile-record">
+              <div class="mobile-record-head">
+                <div class="mobile-record-title">
+                  <span class="mono">{{ version.label }}</span>
+                  <NTag v-if="isInstalled(version)" size="tiny" type="success" :bordered="false">当前</NTag>
+                  <NTag v-if="version.cached" size="tiny" type="info" :bordered="false">已下载</NTag>
+                  <NTag v-if="version.prerelease" size="tiny" type="warning" :bordered="false">预发布</NTag>
+                </div>
+              </div>
+              <p class="mobile-record-description">{{ version.description || '没有发布说明' }}</p>
+              <div class="mobile-record-meta">
+                <span>{{ source === 'kdae' ? '构建' : '发布' }}<strong>{{ formatDateTime(version.publishedAt) }}</strong></span>
+                <span v-if="version.cached">缓存<strong>{{ formatBytes(version.cachedBytes) }}</strong></span>
+              </div>
+              <div class="mobile-action-row">
+                <NTag v-if="!version.installable" size="small" type="error" :bordered="false">已过期</NTag>
+                <NText v-else-if="isInstalled(version) && !status?.drifted" depth="3">已安装</NText>
+                <NButton
+                  v-else
+                  secondary
+                  type="primary"
+                  :disabled="busy || !(status?.ready || firstInstall)"
+                  @click="confirmInstall(version)"
+                >
+                  <template #icon><NIcon><component :is="version.cached && !firstInstall ? SwapHorizontalOutline : CloudDownloadOutline" /></NIcon></template>
+                  {{ firstInstall ? '安装' : '预检并切换' }}
+                </NButton>
+                <NButton
+                  v-if="version.cached"
+                  secondary
+                  type="error"
+                  :aria-label="`删除 ${version.label} 的本地缓存`"
+                  :loading="cacheDeleting === versionKey(version)"
+                  :disabled="busy || cacheDeleting !== ''"
+                  @click="confirmDeleteCached(version)"
+                >
+                  <template #icon><NIcon><TrashOutline /></NIcon></template>删除缓存
+                </NButton>
+              </div>
+            </article>
+          </div>
+          <NEmpty v-else description="没有可用版本" class="mobile-empty" />
+        </NSpin>
       </NCard>
     </template>
 

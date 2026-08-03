@@ -11,12 +11,14 @@ import (
 	"time"
 
 	"github.com/tuoro/kdae-panel/internal/command"
+	"github.com/tuoro/kdae-panel/internal/logfmt"
 )
 
 const (
 	defaultTimeout = 30 * time.Second
 	actionTimeout  = 150 * time.Second
-	maxLogLines    = 500
+	// MaxLogLines 是单次 journald 查询允许返回的最大行数。
+	MaxLogLines = 500
 )
 
 // systemdManager 通过 systemd 的 systemctl/journalctl 管理服务。
@@ -29,21 +31,21 @@ type systemdManager struct {
 }
 
 type Status struct {
-	Name                string `json:"name"`
-	Description         string `json:"description,omitempty"`
-	LoadState           string `json:"loadState,omitempty"`
-	ActiveState         string `json:"activeState,omitempty"`
-	SubState            string `json:"subState,omitempty"`
-	UnitFileState       string `json:"unitFileState,omitempty"`
-	MainPID             int    `json:"mainPid,omitempty"`
-	ExecMainStatus      int    `json:"execMainStatus,omitempty"`
-	ActiveSince         string `json:"activeSince,omitempty"`
-	StartedAt           string `json:"startedAt,omitempty"`
-	MemoryBytes         uint64 `json:"memoryBytes,omitempty"`
+	Name           string `json:"name"`
+	Description    string `json:"description,omitempty"`
+	LoadState      string `json:"loadState,omitempty"`
+	ActiveState    string `json:"activeState,omitempty"`
+	SubState       string `json:"subState,omitempty"`
+	UnitFileState  string `json:"unitFileState,omitempty"`
+	MainPID        int    `json:"mainPid,omitempty"`
+	ExecMainStatus int    `json:"execMainStatus,omitempty"`
+	ActiveSince    string `json:"activeSince,omitempty"`
+	StartedAt      string `json:"startedAt,omitempty"`
+	MemoryBytes    uint64 `json:"memoryBytes,omitempty"`
 	CPUUsageNanoseconds uint64 `json:"cpuUsageNanoseconds,omitempty"`
-	Tasks               uint64 `json:"tasks,omitempty"`
-	Restarts            uint64 `json:"restarts,omitempty"`
-	UnitPath            string `json:"unitPath,omitempty"`
+	Tasks          uint64 `json:"tasks,omitempty"`
+	Restarts       uint64 `json:"restarts,omitempty"`
+	UnitPath       string `json:"unitPath,omitempty"`
 	// ExecStartPath 是单元实际启动的可执行文件。安装新版本时必须替换这个路径，
 	// 否则会出现"替换成功但服务仍在跑旧二进制"的静默失败。
 	ExecStartPath string `json:"execStartPath,omitempty"`
@@ -72,6 +74,10 @@ const (
 	// 对外的服务控制 API 仍只开放 start/stop/restart。
 	ActionEnable  Action = "enable"
 	ActionDisable Action = "disable"
+	// EnableNow/DisableNow 只用于用户主动控制服务：把当前运行状态同步成
+	// systemd 的开机状态。安装与版本切换仍使用普通 start/stop，避免改写原策略。
+	ActionEnableNow  Action = "enable-now"
+	ActionDisableNow Action = "disable-now"
 	// ActionDaemonReload 让 systemd 重新读取单元文件。首次安装写入 dae.service
 	// 之后必须执行它，否则 systemd 看不到新单元。它不作用于具体服务，
 	// 因此不接受服务名参数。
@@ -132,7 +138,6 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 		"ActiveEnterTimestamp",
 		"ExecMainStartTimestamp",
 		"MemoryCurrent",
-		"CPUUsageNSec",
 		"TasksCurrent",
 		"NRestarts",
 		"FragmentPath",
@@ -145,23 +150,22 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 	}
 	values := parseProperties(result.Stdout)
 	status := Status{
-		Name:                valueOr(values, "Id", m.serviceName),
-		Description:         values["Description"],
-		LoadState:           values["LoadState"],
-		ActiveState:         values["ActiveState"],
-		SubState:            values["SubState"],
-		UnitFileState:       values["UnitFileState"],
-		MainPID:             parseInt(values["MainPID"]),
-		ExecMainStatus:      parseInt(values["ExecMainStatus"]),
-		ActiveSince:         values["ActiveEnterTimestamp"],
-		StartedAt:           values["ExecMainStartTimestamp"],
-		MemoryBytes:         parseUint(values["MemoryCurrent"]),
-		CPUUsageNanoseconds: parseUint(values["CPUUsageNSec"]),
-		Tasks:               parseUint(values["TasksCurrent"]),
-		Restarts:            parseUint(values["NRestarts"]),
-		UnitPath:            values["FragmentPath"],
-		ExecStartPath:       parseExecStartPath(values["ExecStart"]),
-		Environment:         parseEnvironment(values["Environment"]),
+		Name:           valueOr(values, "Id", m.serviceName),
+		Description:    values["Description"],
+		LoadState:      values["LoadState"],
+		ActiveState:    values["ActiveState"],
+		SubState:       values["SubState"],
+		UnitFileState:  values["UnitFileState"],
+		MainPID:        parseInt(values["MainPID"]),
+		ExecMainStatus: parseInt(values["ExecMainStatus"]),
+		ActiveSince:    normalizeSystemdTimestamp(values["ActiveEnterTimestamp"]),
+		StartedAt:      normalizeSystemdTimestamp(values["ExecMainStartTimestamp"]),
+		MemoryBytes:    parseUint(values["MemoryCurrent"]),
+		Tasks:          parseUint(values["TasksCurrent"]),
+		Restarts:       parseUint(values["NRestarts"]),
+		UnitPath:       values["FragmentPath"],
+		ExecStartPath:  parseExecStartPath(values["ExecStart"]),
+		Environment:    parseEnvironment(values["Environment"]),
 	}
 	return status, nil
 }
@@ -202,8 +206,14 @@ func parseExecStartPath(value string) string {
 }
 
 func (m *systemdManager) Action(ctx context.Context, action Action) error {
+	var args []string
 	switch action {
 	case ActionStart, ActionStop, ActionRestart, ActionEnable, ActionDisable:
+		args = []string{string(action), m.serviceName}
+	case ActionEnableNow:
+		args = []string{"enable", "--now", m.serviceName}
+	case ActionDisableNow:
+		args = []string{"disable", "--now", m.serviceName}
 	case ActionDaemonReload:
 		// daemon-reload 是全局动作，不带服务名。
 		result, err := m.runFor(ctx, actionTimeout, m.systemctl, "daemon-reload")
@@ -214,11 +224,37 @@ func (m *systemdManager) Action(ctx context.Context, action Action) error {
 	default:
 		return fmt.Errorf("不支持的服务动作 %q", action)
 	}
-	result, err := m.runFor(ctx, actionTimeout, m.systemctl, string(action), m.serviceName)
+	result, err := m.runFor(ctx, actionTimeout, m.systemctl, args...)
 	if err != nil {
-		return fmt.Errorf("执行 systemd %s: %s", action, command.Describe(err, result))
+		return fmt.Errorf("执行 systemd %s: %s", strings.Join(args[:len(args)-1], " "), command.Describe(err, result))
 	}
 	return nil
+}
+
+// normalizeSystemdTimestamp 把 systemd 的本地化时间转成浏览器可可靠解析的 RFC 3339。
+// 直接把 "CST" 交给浏览器会产生歧义：它既可能指中国标准时间，也可能指北美中部时间。
+func normalizeSystemdTimestamp(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "n/a" {
+		return ""
+	}
+	for _, layout := range []string{
+		"Mon 2006-01-02 15:04:05 -07",
+		"Mon 2006-01-02 15:04:05 -0700",
+		"Mon 2006-01-02 15:04:05 -07:00",
+	} {
+		// MST 布局也会接受 "+08"，但会把它当作未知名称并赋予零偏移。
+		// 数字时区必须先按偏移解析，结果才不依赖宿主机的本地时区。
+		parsed, err := time.Parse(layout, value)
+		if err == nil {
+			return parsed.Format(time.RFC3339)
+		}
+	}
+	parsed, err := time.ParseInLocation("Mon 2006-01-02 15:04:05 MST", value, time.Local)
+	if err == nil {
+		return parsed.Format(time.RFC3339)
+	}
+	return ""
 }
 
 // PanelUnit 是面板自身的 systemd 单元名。
@@ -247,8 +283,8 @@ func (m *systemdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error
 	if limit <= 0 {
 		limit = 200
 	}
-	if limit > maxLogLines {
-		limit = maxLogLines
+	if limit > MaxLogLines {
+		limit = MaxLogLines
 	}
 	result, err := m.run(
 		ctx,
@@ -303,12 +339,13 @@ func parseJournal(output string) ([]LogEntry, error) {
 		if err := json.Unmarshal([]byte(line), &raw); err != nil {
 			return nil, fmt.Errorf("解析 journald JSON: %w", err)
 		}
-		priority := parsePriority(rawString(raw["PRIORITY"]))
+		message := rawString(raw["MESSAGE"])
+		priority, level := logLevel(message, parsePriority(rawString(raw["PRIORITY"])))
 		entries = append(entries, LogEntry{
 			Timestamp: journalTimestamp(rawString(raw["__REALTIME_TIMESTAMP"])),
 			Priority:  priority,
-			Level:     priorityLevel(priority),
-			Message:   rawString(raw["MESSAGE"]),
+			Level:     level,
+			Message:   message,
 			Unit:      rawString(raw["_SYSTEMD_UNIT"]),
 			PID:       rawString(raw["_PID"]),
 		})
@@ -317,6 +354,32 @@ func parseJournal(output string) ([]LogEntry, error) {
 		return nil, fmt.Errorf("读取 journald 输出: %w", err)
 	}
 	return entries, nil
+}
+
+// logLevel 优先采用 dae 正文开头的 level 字段。
+// dae 把日志写到标准输出时，journald 通常会把所有行都记成 info；只看 PRIORITY
+// 会把真实的 debug / warning / error 全部误判，前端按级别筛选也就失去意义。
+func logLevel(message string, journalPriority int) (int, string) {
+	if fields, ok := logfmt.Parse(message); ok {
+		value := fields["level"]
+		switch value {
+		case "panic", "fatal", "critical":
+			return 2, "critical"
+		case "error":
+			return 3, "error"
+		case "warn", "warning":
+			return 4, "warning"
+		case "notice":
+			return 5, "notice"
+		case "info":
+			return 6, "info"
+		case "debug":
+			return 7, "debug"
+		case "trace":
+			return 7, "trace"
+		}
+	}
+	return journalPriority, priorityLevel(journalPriority)
 }
 
 func rawString(raw json.RawMessage) string {

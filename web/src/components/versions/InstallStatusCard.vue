@@ -14,6 +14,11 @@ const props = defineProps<{
 }>()
 
 const firstInstall = computed(() => props.provision?.possible === true)
+
+const installedPlatform = computed(() => {
+  if (props.status?.drifted) return '无法确认（文件已被外部替换）'
+  return props.status?.managed?.platform || '未知（旧记录或外部安装）'
+})
 </script>
 
 <template>
@@ -83,7 +88,15 @@ const firstInstall = computed(() => props.provision?.possible === true)
       </div>
       <div>
         <dt>CPU 架构</dt>
-        <dd class="mono">{{ status?.platform || '—' }}</dd>
+        <dd class="mono">{{ status?.architecture || '—' }}</dd>
+      </div>
+      <div>
+        <dt>首选构建</dt>
+        <dd class="mono">{{ status?.preferredPlatform || status?.platform || '—' }}</dd>
+      </div>
+      <div>
+        <dt>当前构建</dt>
+        <dd class="mono">{{ installedPlatform }}</dd>
       </div>
     </dl>
     <NAlert v-if="!busy && status?.drifted" type="warning" :bordered="false">

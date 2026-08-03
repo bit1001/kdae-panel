@@ -3,8 +3,8 @@
 // 安装是一个带回滚的事务，顺序刻意如此：
 //
 //	下载并校验 sha256 → 写入同目录暂存文件 → 用暂存的新二进制跑 --version
-//	→ 用它 validate 现有配置 → 备份当前二进制 → 原子替换 → 重启服务
-//	→ 确认服务已起来；任一步失败都恢复备份并把服务重启回去。
+//	→ 用它 validate 现有配置 → 备份当前二进制 → 原子替换
+//	→ 若服务原本运行则重启并确认稳定；否则保持未运行。
 //
 // 先验证再替换，是为了让"新版本根本跑不起来"或"新版本不认现有配置"这两类
 // 问题在磁盘被改动之前就暴露出来。
@@ -61,6 +61,7 @@ type ServiceController interface {
 type Fetcher interface {
 	List(ctx context.Context, source upstream.Source, limit int) ([]upstream.Version, error)
 	Resolve(ctx context.Context, source upstream.Source, ref string, platform upstream.Platform) (upstream.Asset, error)
+	FetchBinary(ctx context.Context, asset upstream.Asset) ([]byte, error)
 	FetchBundle(ctx context.Context, asset upstream.Asset) (upstream.Bundle, error)
 }
 
@@ -68,12 +69,14 @@ type Fetcher interface {
 // dae --version 对 CI 构建往往无法区分 commit，因此以面板自己的记录为准，
 // 同时保存二进制摘要，用于发现外部手动替换。
 type State struct {
-	Source      upstream.Source `json:"source,omitempty"`
-	Ref         string          `json:"ref,omitempty"`
-	Label       string          `json:"label,omitempty"`
-	Version     string          `json:"version,omitempty"`
-	InstalledAt time.Time       `json:"installedAt,omitempty"`
-	SHA256      string          `json:"sha256,omitempty"`
+	Source upstream.Source `json:"source,omitempty"`
+	Ref    string          `json:"ref,omitempty"`
+	Label  string          `json:"label,omitempty"`
+	// Platform 是安装时实际下载到的资产变体，不是本机首选变体。
+	Platform    string    `json:"platform,omitempty"`
+	Version     string    `json:"version,omitempty"`
+	InstalledAt time.Time `json:"installedAt,omitempty"`
+	SHA256      string    `json:"sha256,omitempty"`
 }
 
 // Status 是对外暴露的安装状态。
@@ -82,7 +85,10 @@ type State struct {
 type Status struct {
 	// BinaryPath 是 systemd 单元实际启动的可执行文件，也是替换的目标。
 	BinaryPath string `json:"binaryPath,omitempty"`
-	Platform   string `json:"platform"`
+	// Platform 保留为首选资产标识，兼容旧客户端。
+	Platform          string `json:"platform"`
+	Architecture      string `json:"architecture"`
+	PreferredPlatform string `json:"preferredPlatform"`
 	// Ready 为假表示还不具备安装条件，Problem 说明原因。
 	Ready bool `json:"ready"`
 	// Present 为假表示目标路径上没有可执行文件。
@@ -99,6 +105,17 @@ type Status struct {
 	// Warnings 是不阻断安装但用户应当知道的问题，如缺少 geo 数据文件。
 	Warnings []string `json:"warnings,omitempty"`
 	Problem  string   `json:"problem,omitempty"`
+}
+
+// Compatibility 是目标二进制对当前机器与配置的只读预检结果。
+// 预检只执行公开命令，不替换二进制，也不触碰服务状态。
+type Compatibility struct {
+	Compatible       bool   `json:"compatible"`
+	Version          string `json:"version,omitempty"`
+	OutlineSupported bool   `json:"outlineSupported"`
+	ConfigPresent    bool   `json:"configPresent"`
+	ValidationError  string `json:"validationError,omitempty"`
+	Problem          string `json:"problem,omitempty"`
 }
 
 type Installer struct {
@@ -267,7 +284,11 @@ func (i *Installer) target(ctx context.Context) (string, bool, error) {
 
 func (i *Installer) Status(ctx context.Context) Status {
 	platform, platformErr := upstream.DetectPlatform()
-	status := Status{Platform: platform.Name}
+	status := Status{
+		Platform:          platform.Name,
+		Architecture:      platform.Architecture,
+		PreferredPlatform: platform.Name,
+	}
 	if platformErr != nil {
 		status.Problem = platformErr.Error()
 		return status
@@ -359,7 +380,7 @@ func (i *Installer) Acquire(ctx context.Context, source upstream.Source, ref, la
 		case err == nil:
 			i.logger.Info("使用已校验的 dae 本地版本", "source", source, "ref", ref,
 				"cached_at", metadata.CachedAt, "bytes", len(content))
-			return upstream.Bundle{Binary: content}, true, nil
+			return upstream.Bundle{Platform: metadata.AssetPlatform, Binary: content}, true, nil
 		case errors.Is(err, ErrCachedVersionNotFound):
 		case errors.Is(err, errInvalidVersionCache):
 			i.logger.Warn("dae 本地版本已损坏，将重新下载", "source", source, "ref", ref, "error", err)
@@ -374,11 +395,17 @@ func (i *Installer) Acquire(ctx context.Context, source upstream.Source, ref, la
 	if err != nil {
 		return upstream.Bundle{}, false, err
 	}
-	bundle, err := i.fetcher.FetchBundle(ctx, asset)
+	var bundle upstream.Bundle
+	if requireBundle {
+		bundle, err = i.fetcher.FetchBundle(ctx, asset)
+	} else {
+		bundle.Binary, err = i.fetcher.FetchBinary(ctx, asset)
+	}
 	if err != nil {
 		return upstream.Bundle{}, false, err
 	}
-	if err := i.cache.store(source, ref, label, platform.Name, bundle.Binary); err != nil {
+	bundle.Platform = asset.Platform
+	if err := i.cache.store(source, ref, label, platform.Name, asset.Platform, bundle.Binary); err != nil {
 		return upstream.Bundle{}, false, fmt.Errorf("保存 dae 本地版本: %w", err)
 	}
 	i.logger.Info("已取得并校验 dae 发布包",
@@ -395,12 +422,67 @@ func (i *Installer) DeleteCached(source upstream.Source, ref string) error {
 	return i.cache.delete(source, ref, platform.Name)
 }
 
+// Preflight 用目标版本执行 --version、export outline 与 validate，但不安装它。
+// binary 已由 Acquire 完成来源校验；这里仍检查 ELF，防止缓存或解包契约回归。
+func (i *Installer) Preflight(ctx context.Context, binary []byte) (Compatibility, error) {
+	result := Compatibility{}
+	if err := assertELF(binary); err != nil {
+		result.Problem = err.Error()
+		return result, nil
+	}
+	directory := filepath.Dir(i.binaryPath)
+	if target, _, err := i.target(ctx); err == nil {
+		directory = filepath.Dir(target)
+	}
+	staged, cleanup, err := atomicfile.Stage(directory, binary, binaryMode)
+	if err != nil {
+		return result, fmt.Errorf("暂存待预检的 dae: %w", err)
+	}
+	defer cleanup()
+
+	probeCtx, cancelProbe := context.WithTimeout(ctx, probeTimeout)
+	report := i.newProbe(staged).Inspect(probeCtx)
+	cancelProbe()
+	result.Version = report.Version
+	result.OutlineSupported = report.OutlineSupported
+	if !report.Available {
+		result.Problem = report.Problem
+		if result.Problem == "" {
+			result.Problem = "目标版本无法在当前机器上运行"
+		}
+		return result, nil
+	}
+
+	if i.configPath == "" {
+		result.Compatible = true
+		return result, nil
+	}
+	if _, err := os.Stat(i.configPath); err != nil {
+		if os.IsNotExist(err) {
+			result.Compatible = true
+			return result, nil
+		}
+		return result, fmt.Errorf("读取当前配置状态: %w", err)
+	}
+	result.ConfigPresent = true
+	validateCtx, cancelValidate := context.WithTimeout(ctx, probeTimeout)
+	err = i.newProbe(staged).Validate(validateCtx, i.configPath)
+	cancelValidate()
+	if err != nil {
+		result.ValidationError = err.Error()
+		return result, nil
+	}
+	result.Compatible = true
+	return result, nil
+}
+
 // Install 把已下载的内容装上去。调用方应在持有全局控制锁时调用它。
-func (i *Installer) Install(ctx context.Context, binary []byte, source upstream.Source, ref, label string) (Status, error) {
+func (i *Installer) Install(ctx context.Context, binary []byte, source upstream.Source, ref, label, platform string) (Status, error) {
 	return i.applyBinary(ctx, binary, &State{
 		Source:      source,
 		Ref:         ref,
 		Label:       label,
+		Platform:    platform,
 		InstalledAt: nowUTC(),
 		SHA256:      digestBytes(binary),
 	})
@@ -428,7 +510,7 @@ func (i *Installer) Rollback(ctx context.Context) (Status, error) {
 	return i.applyBinary(ctx, binary, previous)
 }
 
-// applyBinary 是共用的替换事务：验证 → 备份 → 替换 → 重启 → 失败回滚。
+// applyBinary 是共用的替换事务：验证 → 备份 → 替换；服务原本运行时再重启并在失败时回滚。
 func (i *Installer) applyBinary(ctx context.Context, binary []byte, state *State) (Status, error) {
 	// 这些字节马上就要以 root 落到 ExecStart 指向的位置并被执行。
 	// 首次安装会做这项检查，升级同样不能少：上游若改了打包方式，
@@ -436,7 +518,7 @@ func (i *Installer) applyBinary(ctx context.Context, binary []byte, state *State
 	if err := assertELF(binary); err != nil {
 		return Status{}, err
 	}
-	target, _, err := i.target(ctx)
+	target, wasActive, err := i.target(ctx)
 	if err != nil {
 		return Status{}, err
 	}
@@ -512,30 +594,32 @@ func (i *Installer) applyBinary(ctx context.Context, binary []byte, state *State
 	}
 	committed = true
 
-	if err := i.restart(ctx); err != nil {
-		// 换上去起不来，必须退回原样。回滚用独立的 context：安装用的那个
-		// 预算已被下载和这次失败的重启耗掉大半，甚至可能已经取消——
-		// 而回滚恰恰是最不能因为超时或取消而半途而废的一步。
-		restoreCtx, cancelRestore := context.WithTimeout(
-			context.WithoutCancel(ctx), restartTimeout+i.health)
-		outcome := i.restorePrevious(restoreCtx, target)
-		cancelRestore()
+	if wasActive {
+		if err := i.restart(ctx); err != nil {
+			// 换上去起不来，必须退回原样。回滚用独立的 context：安装用的那个
+			// 预算已被下载和这次失败的重启耗掉大半，甚至可能已经取消——
+			// 而回滚恰恰是最不能因为超时或取消而半途而废的一步。
+			restoreCtx, cancelRestore := context.WithTimeout(
+				context.WithoutCancel(ctx), restartTimeout+i.health)
+			outcome := i.restorePrevious(restoreCtx, target)
+			cancelRestore()
 
-		backupSettled = true
-		if outcome.RestoreErr == nil {
-			i.discardBackup() // 磁盘已退回旧版本，原有回滚点仍然有效
-		} else {
-			i.commitBackup(pending) // 磁盘上留着新版本，暂存的旧版本正是它的上一版
-		}
-		failure := outcome.RestoreErr
-		if failure == nil {
-			failure = outcome.RestartErr
-		}
-		return Status{}, &ApplyError{
-			Cause:            err,
-			RolledBack:       outcome.RestoreErr == nil,
-			ServiceRecovered: outcome.RestoreErr == nil && outcome.RestartErr == nil,
-			RestoreErr:       failure,
+			backupSettled = true
+			if outcome.RestoreErr == nil {
+				i.discardBackup() // 磁盘已退回旧版本，原有回滚点仍然有效
+			} else {
+				i.commitBackup(pending) // 磁盘上留着新版本，暂存的旧版本正是它的上一版
+			}
+			failure := outcome.RestoreErr
+			if failure == nil {
+				failure = outcome.RestartErr
+			}
+			return Status{}, &ApplyError{
+				Cause:            err,
+				RolledBack:       outcome.RestoreErr == nil,
+				ServiceRecovered: outcome.RestoreErr == nil && outcome.RestartErr == nil,
+				RestoreErr:       failure,
+			}
 		}
 	}
 	i.commitBackup(pending)
@@ -551,7 +635,7 @@ func (i *Installer) applyBinary(ctx context.Context, binary []byte, state *State
 		// 安装本身已经成功，不能因此报错；但账本没写上，后续状态查询会把这次
 		// 安装误报成"在面板之外被替换过"，必须让用户当场看见。
 		status.Warnings = append(status.Warnings, fmt.Sprintf(
-			"新版本已装上并运行，但安装记录写入失败（%v）；面板会把它显示为在面板之外替换过", stateErr))
+			"新版本已装上，但安装记录写入失败（%v）；面板会把它显示为在面板之外替换过", stateErr))
 	}
 	return status, nil
 }
@@ -628,7 +712,7 @@ func (i *Installer) backupCurrent(target string) (*pendingBackup, error) {
 		// 面板外替换的未知二进制，绝不能冒充已知版本。
 		if state.Source != "" && state.Ref != "" && state.SHA256 != "" && state.SHA256 == digestBytes(current) {
 			if platform, err := upstream.DetectPlatform(); err == nil {
-				if err := i.cache.store(state.Source, state.Ref, state.Label, platform.Name, current); err != nil {
+				if err := i.cache.store(state.Source, state.Ref, state.Label, platform.Name, state.Platform, current); err != nil {
 					i.logger.Warn("保留当前 dae 本地版本失败", "source", state.Source, "ref", state.Ref, "error", err)
 				}
 			}

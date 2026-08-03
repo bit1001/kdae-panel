@@ -25,6 +25,25 @@ export interface DaeReport {
   detectedAt: string
 }
 
+export type DiagnosticLevel = 'ok' | 'warning' | 'error' | 'unknown'
+
+export interface DiagnosticItem {
+  id: string
+  category: string
+  title: string
+  level: DiagnosticLevel
+  summary: string
+  details?: string[]
+  suggestion?: string
+}
+
+export interface DiagnosticReport {
+  generatedAt: string
+  overall: DiagnosticLevel
+  counts: Record<DiagnosticLevel, number>
+  items: DiagnosticItem[]
+}
+
 export interface OutlineElement {
   name?: string
   mapping?: string
@@ -54,10 +73,10 @@ export interface ServiceStatus {
   activeSince?: string
   startedAt?: string
   memoryBytes?: number
-  cpuUsageNanoseconds?: number
   tasks?: number
   restarts?: number
   unitPath?: string
+  suspended?: boolean
 }
 
 export interface NetworkInterface {
@@ -78,6 +97,7 @@ export interface ConfigSaveResult {
   hash: string
   backupId?: string
   applied: boolean
+  deferred?: boolean
   savedAt: string
   rolledBack: boolean
 }
@@ -88,6 +108,27 @@ export interface ConfigBackup {
   size: number
   createdAt: string
   sourcePath: string
+  name?: string
+  note?: string
+}
+
+export interface ConfigDiffLine {
+  kind: 'context' | 'add' | 'remove' | 'skip'
+  oldLine?: number
+  newLine?: number
+  text: string
+  skipCount?: number
+}
+
+export interface ConfigBackupPreview {
+  backup: ConfigBackup
+  currentHash: string
+  currentPresent: boolean
+  same: boolean
+  valid: boolean
+  validationError?: string
+  diff: ConfigDiffLine[]
+  diffTruncated?: boolean
 }
 
 export type UpstreamSource = 'official' | 'kdae'
@@ -112,6 +153,7 @@ export interface InstalledState {
   source?: UpstreamSource
   ref?: string
   label?: string
+  platform?: string
   version?: string
   installedAt?: string
   sha256?: string
@@ -119,7 +161,10 @@ export interface InstalledState {
 
 export interface InstallStatus {
   binaryPath?: string
+  /** @deprecated 兼容旧客户端的首选构建标识。 */
   platform: string
+  architecture?: string
+  preferredPlatform?: string
   ready: boolean
   present: boolean
   version?: string
@@ -154,6 +199,19 @@ export interface InstallJob {
   error?: string
 }
 
+export interface DaeCompatibility {
+  compatible: boolean
+  version?: string
+  outlineSupported: boolean
+  configPresent: boolean
+  validationError?: string
+  problem?: string
+}
+
+export interface CompatibilityJob extends InstallJob {
+  result?: DaeCompatibility
+}
+
 export interface GeoFile {
   name: string
   path?: string
@@ -162,6 +220,18 @@ export interface GeoFile {
   modTime?: string
   /** 被 path 遮蔽的同名副本；dae 只读优先级最高的那一份。 */
   shadowed?: string[]
+  /** 下一次更新时该文件的落盘位置。 */
+  targetPath: string
+}
+
+export interface GeoResidual {
+  path: string
+  kind: 'temporary' | 'rollback'
+  size: number
+  modTime: string
+  targetPath?: string
+  restorable: boolean
+  deletable: boolean
 }
 
 export type GeoSource = 'loyalsoldier' | 'v2fly' | `custom:${string}`
@@ -201,10 +271,13 @@ export interface GeoStatus {
   targetDir: string
   searchPath: string[]
   files: GeoFile[]
+  residuals?: GeoResidual[]
   updatable: boolean
   problem?: string
   managed?: GeoState
   warnings?: string[]
+  /** active 时立即 reload；inactive 时文件在 dae 下次启动时读取。 */
+  serviceState: 'active' | 'inactive' | 'unknown'
 }
 
 /** 面板自身的新版本检查结果；dev 构建或检查被关闭时 latest 为空。 */
@@ -258,7 +331,24 @@ export interface LatencyResult {
   port: number
   reachable: boolean
   latencyMs?: number
+  resolvedIp?: string
+  method?: 'tcp' | 'icmp'
   error?: string
+}
+
+export interface SubscriptionNode {
+  name: string
+  protocol?: string
+  host?: string
+  matches: number
+}
+
+export interface SubscriptionNodeSource {
+  tag: string
+  nodes: SubscriptionNode[]
+  cachedAt: string
+  skipped?: number
+  problem?: string
 }
 
 export interface LogEntry {
@@ -268,4 +358,63 @@ export interface LogEntry {
   message: string
   unit?: string
   pid?: string
+}
+
+export interface ConnectionEvent {
+  at: string
+  network: 'tcp4' | 'tcp6' | 'udp4' | 'udp6'
+  src: string
+  dst: string
+  dstAddr?: string
+  sniffed?: string
+  outbound?: string
+  dialer?: string
+  policy?: string
+  pname?: string
+  mac?: string
+  offloaded?: boolean
+  approxTime?: boolean
+}
+
+export interface ConnectionEndpoint {
+  address: string
+  count: number
+}
+
+export interface ConnectionFacet {
+  id: string
+  label: string
+  count: number
+  note?: string
+}
+
+export interface ConnectionFacets {
+  targets: ConnectionFacet[]
+  clients: ConnectionFacet[]
+  nodes: ConnectionFacet[]
+  groups: ConnectionFacet[]
+}
+
+export interface ConnectionsResponse {
+  snapshotAt: string
+  snapshotOk: boolean
+  serviceRunning: boolean
+  socketWindowSeconds: number
+  logsOk: boolean
+  logLevel?: 'error' | 'warn' | 'info' | 'debug' | 'trace'
+  dropped?: number
+  truncated?: boolean
+  facetLimited?: boolean
+  summary: {
+    outboundTcp: number
+    udpSockets: number
+    sampledTcpPeak: number
+    sampledUdpPeak: number
+    windowEvents: number
+    windowClients: number
+    windowTargets: number
+  }
+  facets: ConnectionFacets
+  endpoints: ConnectionEndpoint[]
+  entries: ConnectionEvent[]
 }

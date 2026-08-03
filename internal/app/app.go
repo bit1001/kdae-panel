@@ -22,13 +22,16 @@ import (
 	"github.com/tuoro/kdae-panel/internal/auth"
 	"github.com/tuoro/kdae-panel/internal/configstore"
 	"github.com/tuoro/kdae-panel/internal/dae"
+	"github.com/tuoro/kdae-panel/internal/daeconn"
 	"github.com/tuoro/kdae-panel/internal/daeinstall"
+	"github.com/tuoro/kdae-panel/internal/diagnostics"
 	"github.com/tuoro/kdae-panel/internal/geodata"
 	"github.com/tuoro/kdae-panel/internal/githubauth"
 	"github.com/tuoro/kdae-panel/internal/host"
 	"github.com/tuoro/kdae-panel/internal/netprobe"
 	"github.com/tuoro/kdae-panel/internal/panelupdate"
 	"github.com/tuoro/kdae-panel/internal/schedule"
+	"github.com/tuoro/kdae-panel/internal/subscriptioncache"
 	"github.com/tuoro/kdae-panel/internal/upstream"
 	"github.com/tuoro/kdae-panel/internal/webui"
 )
@@ -52,22 +55,33 @@ type ConfigurationService interface {
 	Validate(ctx context.Context, content string) error
 	Save(ctx context.Context, content, expectedHash string, apply bool) (configstore.SaveResult, error)
 	ListBackups(ctx context.Context) ([]configstore.Backup, error)
+	CreateBackup(ctx context.Context, name, note string) (configstore.Backup, error)
+	UpdateBackup(ctx context.Context, backupID, name, note string) (configstore.Backup, error)
+	DeleteBackup(ctx context.Context, backupID string) error
+	ExportBackup(ctx context.Context, backupID string) (configstore.BackupExport, error)
+	PreviewBackup(ctx context.Context, backupID string) (configstore.BackupPreview, error)
 	Restore(ctx context.Context, backupID, expectedHash string, apply bool) (configstore.SaveResult, error)
 }
 
 type Dependencies struct {
-	Dae            DaeService
-	Configuration  ConfigurationService
-	Host           HostService
-	Authentication AuthenticationService
-	Probe          ProbeService
-	Schedule       ScheduleService
-	GeoSchedule    ScheduleService
-	Install        InstallService
-	Geo            GeoService
-	PanelRelease   PanelReleaseChecker
-	PanelUpdate    PanelUpdateService
-	GitHub         GitHubCredentialService
+	Dae               DaeService
+	Configuration     ConfigurationService
+	Host              HostService
+	Authentication    AuthenticationService
+	Probe             ProbeService
+	Schedule          ScheduleService
+	GeoSchedule       ScheduleService
+	Install           InstallService
+	Geo               GeoService
+	PanelRelease      PanelReleaseChecker
+	PanelUpdate       PanelUpdateService
+	GitHub            GitHubCredentialService
+	SubscriptionNodes SubscriptionNodeService
+	Connections       daeconn.Snapshotter
+}
+
+type SubscriptionNodeService interface {
+	List(ctx context.Context) ([]subscriptioncache.Source, error)
 }
 
 type AuthenticationService interface {
@@ -89,13 +103,15 @@ type HostService interface {
 func New(cfg Config, logger *slog.Logger) (*App, error) {
 	cfg = cfg.withDefaults()
 	daeClient := dae.NewClient(cfg.DaeBinary)
-	configuration, err := configstore.NewManager(cfg.DaeConfigPath, cfg.BackupDir, daeClient)
-	if err != nil {
-		return nil, fmt.Errorf("初始化配置管理器: %w", err)
-	}
 	hostManager, err := host.NewManager(cfg.ServiceName, cfg.Systemctl, cfg.Journalctl)
 	if err != nil {
 		return nil, fmt.Errorf("初始化主机服务管理器: %w", err)
+	}
+	adoptRunningServiceBootState(hostManager, logger)
+	daeService := newSystemdDaeService(daeClient, daeClient, daeClient, hostManager)
+	configuration, err := configstore.NewManager(cfg.DaeConfigPath, cfg.BackupDir, daeService)
+	if err != nil {
+		return nil, fmt.Errorf("初始化配置管理器: %w", err)
 	}
 	authStore, err := auth.Open(cfg.DatabasePath, cfg.SessionTTL)
 	if err != nil {
@@ -123,13 +139,19 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 		setupURLs = bootstrapSetupURLs(cfg.ListenAddress, cfg.BootstrapToken)
 	}
 	dependencies := Dependencies{
-		Dae:            daeClient,
+		Dae:            daeService,
 		Configuration:  configuration,
 		Host:           hostManager,
 		Authentication: authStore,
 		Probe:          netprobe.New(),
 		GitHub:         githubCredentials,
 	}
+	subscriptionNodes, err := subscriptioncache.New(cfg.DaeConfigPath)
+	if err != nil {
+		_ = authStore.Close()
+		return nil, fmt.Errorf("初始化订阅节点缓存: %w", err)
+	}
+	dependencies.SubscriptionNodes = subscriptionNodes
 	if cfg.EnableDaeInstall {
 		installer, err := daeinstall.New(daeinstall.Options{
 			BinaryPath:  cfg.DaeBinary,
@@ -197,6 +219,23 @@ func New(cfg Config, logger *slog.Logger) (*App, error) {
 	return application, nil
 }
 
+// adoptRunningServiceBootState 迁移旧版面板留下的“正在运行但未启用”状态。
+// 新版服务控制会在每次启停时同步 systemd；这里只补一次历史缺口，而且绝不根据
+// inactive 状态自动 disable，避免面板与 dae 在开机时并行启动造成竞态。
+func adoptRunningServiceBootState(service HostService, logger *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	status, err := service.Status(ctx)
+	if err != nil || status.ActiveState != "active" || status.UnitFileState != "disabled" {
+		return
+	}
+	if err := service.Action(ctx, host.ActionEnable); err != nil {
+		logger.Warn("无法把正在运行的 dae 迁移为随系统启动", "error", err)
+		return
+	}
+	logger.Info("已把正在运行的 dae 迁移为随系统启动")
+}
+
 func NewWithDae(cfg Config, logger *slog.Logger, daeService DaeService) (*App, error) {
 	return NewWithDependencies(cfg, logger, Dependencies{Dae: daeService})
 }
@@ -224,7 +263,11 @@ func NewWithDependencies(cfg Config, logger *slog.Logger, dependencies Dependenc
 					return errors.New("另一个控制操作正在执行，本轮已跳过")
 				}
 				defer operations.Unlock()
-				return dependencies.Dae.Reload(ctx)
+				err := dependencies.Dae.Reload(ctx)
+				if errors.Is(err, configstore.ErrReloadDeferred) {
+					return nil
+				}
+				return err
 			},
 		})
 		if err != nil {
@@ -283,11 +326,20 @@ func NewWithDependencies(cfg Config, logger *slog.Logger, dependencies Dependenc
 	})
 	registerConfigurationRoutes(router, dependencies.Configuration, operations)
 	registerServiceRoutes(router, dependencies.Dae, dependencies.Host, operations)
+	registerConnectionRoutes(router, dependencies.Host, dependencies.Configuration, dependencies.Connections)
 	registerProbeRoutes(router, dependencies.Probe, logger)
+	registerSubscriptionNodeRoutes(router, dependencies.SubscriptionNodes)
 	registerScheduleRoutes(router, "/api/v1/schedule/reload", scheduleService)
 	registerScheduleRoutes(router, "/api/v1/schedule/geo", geoScheduleService)
 	registerUpstreamRoutes(router, dependencies.Install, operations, logger)
 	registerGeoRoutes(router, geo, geoSources)
+	diagnosticCollector := diagnostics.New(diagnostics.Options{
+		Dae: dependencies.Dae, Configuration: dependencies.Configuration,
+		Host: dependencies.Host, Geo: dependencies.Geo,
+	})
+	router.HandleFunc("GET /api/v1/diagnostics/report", func(writer http.ResponseWriter, request *http.Request) {
+		writeJSON(writer, http.StatusOK, diagnosticCollector.Report(request.Context()))
+	})
 	registerAuthenticationRoutes(router, dependencies.Authentication, cfg.SecureCookie, cfg.BootstrapToken, cfg.SetupURLFile, proxyTrust, logger)
 	apiNotFound := func(writer http.ResponseWriter, _ *http.Request) {
 		writeAPIError(writer, http.StatusNotFound, "api_not_found", "API 路径不存在")

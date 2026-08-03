@@ -5,6 +5,7 @@ import (
 	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path"
 	"strings"
 	"testing"
@@ -15,6 +16,24 @@ func get(t *testing.T, target string) *http.Response {
 	recorder := httptest.NewRecorder()
 	Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, target, nil))
 	return recorder.Result()
+}
+
+// Vite 有时会生成 _common-*.js。普通 go:embed 会静默排除以下划线或点
+// 开头的文件，因此逐个核对磁盘产物，避免发布包直到浏览器运行时才白屏。
+func TestAllDistFilesAreEmbedded(t *testing.T) {
+	onDisk := os.DirFS(".")
+	err := fs.WalkDir(onDisk, "dist", func(name string, entry fs.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return err
+		}
+		if _, err := fs.Stat(assets, name); err != nil {
+			t.Errorf("构建产物 %s 没有被嵌入: %v", name, err)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
 }
 
 // 目录也让 fs.Stat 成功，早先因此被交给 FileServer，而 assets/ 下没有
@@ -92,6 +111,23 @@ func TestRealAssetsAreServed(t *testing.T) {
 	}
 	if len(body) == 0 {
 		t.Fatalf("%s 内容为空", sample)
+	}
+}
+
+func TestFaviconIsEmbeddedAndServed(t *testing.T) {
+	response := get(t, "/favicon.svg")
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("favicon 状态码 = %d", response.StatusCode)
+	}
+	if contentType := response.Header.Get("Content-Type"); !strings.Contains(contentType, "image/svg+xml") {
+		t.Fatalf("favicon Content-Type = %q", contentType)
+	}
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "<svg") || strings.Contains(string(body), "<div id=\"app\">") {
+		t.Fatalf("favicon 没有返回 SVG 资源: %q", string(body))
 	}
 }
 

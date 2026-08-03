@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tuoro/kdae-panel/internal/atomicfile"
+	"github.com/tuoro/kdae-panel/internal/host"
 	"github.com/tuoro/kdae-panel/internal/upstream"
 )
 
@@ -42,15 +43,25 @@ var systemDirs = []string{
 // 顺序错了后果很实际：往低优先级目录写的更新永远不会生效，而检查却显示已就位。
 //
 // environment 是 dae 单元声明的环境变量，可以为 nil。
+// 返回值按清理后的路径去重，避免同一目录被误报为自己的遮蔽副本。
 func SearchPath(configPath string, environment map[string]string) []string {
-	paths := []string{}
+	candidates := make([]string, 0, len(systemDirs)+2)
 	if directory := environment[LocationAssetEnv]; directory != "" {
-		paths = append(paths, directory)
+		candidates = append(candidates, directory)
 	}
 	if configPath != "" {
-		paths = append(paths, filepath.Dir(configPath))
+		candidates = append(candidates, filepath.Dir(configPath))
 	}
-	return append(paths, systemDirs...)
+	candidates = append(candidates, systemDirs...)
+
+	paths := make([]string, 0, len(candidates))
+	for _, directory := range candidates {
+		directory = filepath.Clean(directory)
+		if !slices.Contains(paths, directory) {
+			paths = append(paths, directory)
+		}
+	}
+	return paths
 }
 
 // MissingWarning 在面板可见的目录里都找不到 geo 数据时提醒，找得到就返回空。
@@ -71,16 +82,35 @@ func MissingWarning(searchPath []string) string {
 	return ""
 }
 
-// searchPath 取回本机当前的搜索顺序。
-// 读不到服务状态就当没设置环境变量：少一条提示，好过据此把 geo 写到错误的地方。
-func (m *Manager) searchPath(ctx context.Context) []string {
-	var environment map[string]string
-	if m.service != nil {
-		if status, err := m.service.Status(ctx); err == nil {
-			environment = status.Environment
+type serviceSnapshot struct {
+	status  host.Status
+	state   ServiceState
+	problem string
+}
+
+// inspectService 同时提供 geo 搜索路径所需的环境变量，以及 reload 所需的 PID。
+func (m *Manager) inspectService(ctx context.Context) serviceSnapshot {
+	if m.service == nil {
+		return serviceSnapshot{state: ServiceStateUnknown}
+	}
+	status, err := m.service.Status(ctx)
+	if err != nil {
+		return serviceSnapshot{
+			state:   ServiceStateUnknown,
+			problem: fmt.Sprintf("无法确认 dae 服务状态（%v）；更新时将使用 dae 默认的 PID 文件", err),
 		}
 	}
-	return SearchPath(m.configPath, environment)
+	if status.ActiveState == "active" && status.MainPID > 0 {
+		return serviceSnapshot{status: status, state: ServiceStateActive}
+	}
+	if status.ActiveState == "active" {
+		return serviceSnapshot{
+			status:  status,
+			state:   ServiceStateUnknown,
+			problem: "dae 服务显示为 active，但 systemd 没有提供有效 MainPID；更新时将使用 dae 默认的 PID 文件",
+		}
+	}
+	return serviceSnapshot{status: status, state: ServiceStateInactive}
 }
 
 // locate 沿搜索顺序找出每个文件实际生效的那一份，以及被它遮蔽的其余副本。
@@ -88,6 +118,7 @@ func locate(searchPath []string, names []string) []File {
 	files := make([]File, 0, len(names))
 	for _, name := range names {
 		file := File{Name: name}
+		var effective os.FileInfo
 		for _, directory := range searchPath {
 			candidate := filepath.Join(directory, name)
 			info, err := os.Stat(candidate)
@@ -97,6 +128,12 @@ func locate(searchPath []string, names []string) []File {
 			if !file.Present {
 				modTime := info.ModTime().UTC()
 				file.Present, file.Path, file.Size, file.ModTime = true, candidate, info.Size(), &modTime
+				effective = info
+				continue
+			}
+			// 同一文件经由重复目录或符号链接出现时并不是被遮蔽的副本，
+			// 否则界面会错误建议用户删除唯一生效的 Geo 文件。
+			if os.SameFile(effective, info) {
 				continue
 			}
 			// dae 只读优先级最高的那一份，其余的既占磁盘，又会让人以为
@@ -108,35 +145,59 @@ func locate(searchPath []string, names []string) []File {
 	return files
 }
 
-// targetDir 选出本次更新要写入的目录。
+// assignTargets 逐文件选出本次更新的落盘位置。
 //
 // 规则是"就地更新实际生效的那一份"，而不是无脑写死某个目录：dae-installer 把
 // geo 装在 /usr/local/share/dae，若面板改往配置目录写，会生成一份优先级更高的
 // 副本，从此用户跑上游更新脚本将毫无效果且没有任何提示。
 //
-// 两个文件都不存在时才退回配置目录——它在搜索顺序里优先级最高（仅次于
+// 某个文件不存在时才让该文件退回配置目录——它在搜索顺序里优先级最高（仅次于
 // DAE_LOCATION_ASSET），且本来就在面板的 ReadWritePaths 里，不必放宽沙箱。
-func targetDir(files []File, fallback string) string {
-	for _, file := range files {
-		if file.Present {
-			return filepath.Dir(file.Path)
+func assignTargets(files []File, fallback string) {
+	for index := range files {
+		if files[index].Present {
+			files[index].TargetPath = files[index].Path
+		} else {
+			files[index].TargetPath = filepath.Join(fallback, files[index].Name)
 		}
 	}
-	return fallback
+}
+
+func commonTargetDir(files []File) string {
+	var common string
+	for _, file := range files {
+		directory := filepath.Dir(file.TargetPath)
+		if common == "" {
+			common = directory
+			continue
+		}
+		if directory != common {
+			return ""
+		}
+	}
+	return common
 }
 
 // Status 汇报 geo 数据的现状与可更新性。
 func (m *Manager) Status(ctx context.Context) Status {
-	search := m.searchPath(ctx)
+	service := m.inspectService(ctx)
+	search := SearchPath(m.configPath, service.status.Environment)
 	files := locate(search, Names)
-	target := targetDir(files, filepath.Dir(m.configPath))
+	configDir := filepath.Dir(m.configPath)
+	assignTargets(files, configDir)
+	residuals := findResiduals(search)
 
 	status := Status{
 		Sources:       m.fetcher.Sources(),
 		DefaultSource: upstream.GeoSourceLoyalsoldier,
-		TargetDir:     target,
+		TargetDir:     commonTargetDir(files),
 		SearchPath:    search,
 		Files:         files,
+		Residuals:     residuals,
+		ServiceState:  service.state,
+	}
+	if service.problem != "" {
+		status.Warnings = append(status.Warnings, service.problem)
 	}
 	if state, err := m.readState(); err == nil && state != nil {
 		status.Managed = state
@@ -153,18 +214,35 @@ func (m *Manager) Status(ctx context.Context) Status {
 		}
 	}
 
-	if err := atomicfile.Writable(target); err != nil {
-		status.Problem = fmt.Sprintf(
-			"面板无法写入 %s：%v；请在 kdae-panel.service 的 ReadWritePaths 中加入该目录", target, err)
-		return status
+	for _, residual := range residuals {
+		if residual.Kind == ResidualRollback {
+			status.Problem = "发现上次 Geo 更新遗留的回滚点；请先恢复缺失的正式文件，或确认当前文件正常后清理回滚点"
+			return status
+		}
+	}
+	checked := make(map[string]bool)
+	for _, file := range files {
+		target := filepath.Dir(file.TargetPath)
+		if checked[target] {
+			continue
+		}
+		checked[target] = true
+		if err := atomicfile.Writable(target); err != nil {
+			status.Problem = fmt.Sprintf(
+				"面板无法写入 %s：%v；请在 kdae-panel.service 的 ReadWritePaths 中加入该目录", target, err)
+			return status
+		}
 	}
 	status.Updatable = true
-	status.Warnings = append(status.Warnings, warnings(files, target, filepath.Dir(m.configPath))...)
+	status.Warnings = append(status.Warnings, warnings(files, configDir)...)
+	if slices.ContainsFunc(residuals, func(item Residual) bool { return item.Kind == ResidualTemporary }) {
+		status.Warnings = append(status.Warnings, "发现异常退出遗留的 Geo 暂存文件；它们不会生效，可直接清理，下一次更新也会自动清理")
+	}
 	return status
 }
 
 // warnings 说明那些"更新会成功、但结果可能出乎意料"的情况。
-func warnings(files []File, target, configDir string) []string {
+func warnings(files []File, configDir string) []string {
 	var result []string
 	for _, file := range files {
 		if len(file.Shadowed) > 0 {
@@ -172,18 +250,9 @@ func warnings(files []File, target, configDir string) []string {
 				"%s 同时存在于多个目录，dae 只读 %s；%v 里的副本不会生效，可以删掉",
 				file.Name, file.Path, file.Shadowed))
 		}
-		if file.Present && filepath.Dir(file.Path) != target {
+		if !file.Present {
 			result = append(result, fmt.Sprintf(
-				"%s 目前在 %s，本次更新会写到优先级更高的 %s；此后它以新位置为准",
-				file.Name, file.Path, target))
-		}
-	}
-	if target == configDir {
-		for _, file := range files {
-			if !file.Present {
-				result = append(result, fmt.Sprintf(
-					"%s 尚未安装，将写入 %s（dae 搜索顺序里优先级最高的可写目录）", file.Name, configDir))
-			}
+				"%s 尚未安装，将写入 %s（dae 搜索顺序里优先级最高的可写目录）", file.Name, configDir))
 		}
 	}
 	return result

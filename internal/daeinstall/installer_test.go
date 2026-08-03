@@ -18,24 +18,38 @@ import (
 )
 
 type fakeFetcher struct {
-	binary     []byte
-	versions   []upstream.Version
-	listErr    error
-	resolveErr error
-	fetchErr   error
-	fetches    int
+	binary        []byte
+	assetPlatform string
+	versions      []upstream.Version
+	listErr       error
+	resolveErr    error
+	fetchErr      error
+	fetches       int
+	binaryFetches int
+	bundleFetches int
 }
 
 func (f *fakeFetcher) List(context.Context, upstream.Source, int) ([]upstream.Version, error) {
 	return f.versions, f.listErr
 }
 
-func (f *fakeFetcher) Resolve(context.Context, upstream.Source, string, upstream.Platform) (upstream.Asset, error) {
-	return upstream.Asset{}, f.resolveErr
+func (f *fakeFetcher) Resolve(_ context.Context, _ upstream.Source, _ string, platform upstream.Platform) (upstream.Asset, error) {
+	selected := f.assetPlatform
+	if selected == "" {
+		selected = platform.Name
+	}
+	return upstream.Asset{Platform: selected}, f.resolveErr
+}
+
+func (f *fakeFetcher) FetchBinary(context.Context, upstream.Asset) ([]byte, error) {
+	f.fetches++
+	f.binaryFetches++
+	return f.binary, f.fetchErr
 }
 
 func (f *fakeFetcher) FetchBundle(context.Context, upstream.Asset) (upstream.Bundle, error) {
 	f.fetches++
+	f.bundleFetches++
 	return upstream.Bundle{Binary: f.binary}, f.fetchErr
 }
 
@@ -180,7 +194,7 @@ func TestInstallUpgrade(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
-	status, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	status, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "x86_64_v2_sse")
 	if err != nil {
 		t.Fatalf("升级失败: %v", err)
 	}
@@ -200,11 +214,67 @@ func TestInstallUpgrade(t *testing.T) {
 	if !status.Present || status.Managed == nil || status.Managed.Ref != "v2.0.0" {
 		t.Fatalf("状态异常: %+v", status)
 	}
+	if status.Managed.Platform != "x86_64_v2_sse" {
+		t.Fatalf("安装账本的实际资产变体 = %q", status.Managed.Platform)
+	}
 	if !status.RollbackAvailable {
 		t.Fatal("升级后应可回滚")
 	}
 	if len(service.actions) != 1 || service.actions[0] != host.ActionRestart {
 		t.Fatalf("应当重启服务（eBPF 需重新挂载），实际 %v", service.actions)
+	}
+}
+
+func TestPreflightValidatesWithoutReplacingBinary(t *testing.T) {
+	service := &fakeService{}
+	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, service)
+	seed(t, binaryPath, "v1")
+
+	result, err := installer.Preflight(context.Background(), elf("v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !result.Compatible || !result.ConfigPresent || result.Version != "dae \x7fELFv2" {
+		t.Fatalf("预检结果异常: %+v", result)
+	}
+	if content, _ := os.ReadFile(binaryPath); string(content) != string(elf("v1")) {
+		t.Fatalf("预检不应替换当前二进制: %q", content)
+	}
+	if len(service.actions) != 0 {
+		t.Fatalf("预检不应控制服务: %v", service.actions)
+	}
+}
+
+func TestPreflightReportsConfigurationIncompatibility(t *testing.T) {
+	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, &fakeService{})
+	seed(t, binaryPath, "v1")
+
+	result, err := installer.Preflight(context.Background(), elf("rejects-config"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.Compatible || !strings.Contains(result.ValidationError, "不认识的字段") {
+		t.Fatalf("应明确报告配置不兼容: %+v", result)
+	}
+}
+
+func TestInstallPreservesInactiveServiceState(t *testing.T) {
+	service := &fakeService{activeState: "inactive"}
+	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, service)
+	seed(t, binaryPath, "v1")
+
+	status, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
+	if err != nil {
+		t.Fatalf("切换未运行的 dae 失败: %v", err)
+	}
+	if len(service.actions) != 0 {
+		t.Fatalf("切换前服务未运行，不应触发 systemd 动作，实际 %v", service.actions)
+	}
+	if status.ServiceActive {
+		t.Fatal("切换后服务应保持未运行")
+	}
+	if content, _ := os.ReadFile(binaryPath); string(content) != string(elf("v2")) {
+		t.Fatalf("二进制内容 = %q，应已切换到 v2", content)
 	}
 }
 
@@ -226,7 +296,7 @@ func TestInstallTargetsServiceExecStartNotConfiguredPath(t *testing.T) {
 	}
 	service.execStart = actual
 
-	status, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	status, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
 	if err != nil {
 		t.Fatalf("安装失败: %v", err)
 	}
@@ -258,7 +328,7 @@ func TestInstallRefusesUnrelatedExecStartTarget(t *testing.T) {
 	}
 	service.execStart = unrelated
 
-	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
 	if err == nil || !strings.Contains(err.Error(), "为避免覆盖无关程序") {
 		t.Fatalf("非 dae 目标应被拒绝，得到 %v", err)
 	}
@@ -273,7 +343,7 @@ func TestInstallRefusesWhenServiceHasNoExecStart(t *testing.T) {
 	installer, _ := newTestInstaller(t, fetcher, service)
 	service.execStart = "" // dae 尚未作为 systemd 服务安装
 
-	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
 	if err == nil || !strings.Contains(err.Error(), "尚未作为 systemd 服务安装") {
 		t.Fatalf("没有服务时应拒绝安装，得到 %v", err)
 	}
@@ -289,7 +359,7 @@ func TestInstallRefusesFirstTimeInstall(t *testing.T) {
 	// 目标不存在：面板不做首次安装，也不去猜该往哪装
 	_ = os.Remove(binaryPath)
 
-	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
 	if err == nil || !strings.Contains(err.Error(), "首次安装") {
 		t.Fatalf("目标不存在时应指引用官方安装器，得到 %v", err)
 	}
@@ -301,7 +371,7 @@ func TestInstallRejectsBinaryThatCannotRun(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
-	_, err := installer.Install(context.Background(), elf("broken"), upstream.SourceOfficial, "v9.9.9", "v9.9.9")
+	_, err := installer.Install(context.Background(), elf("broken"), upstream.SourceOfficial, "v9.9.9", "v9.9.9", "")
 	if err == nil || !strings.Contains(err.Error(), "无法运行") {
 		t.Fatalf("跑不起来的版本应在替换前被拒绝，得到 %v", err)
 	}
@@ -319,7 +389,7 @@ func TestInstallRejectsBinaryThatRejectsConfig(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
-	_, err := installer.Install(context.Background(), elf("rejects-config"), upstream.SourceOfficial, "v3.0.0", "v3.0.0")
+	_, err := installer.Install(context.Background(), elf("rejects-config"), upstream.SourceOfficial, "v3.0.0", "v3.0.0", "")
 	if err == nil || !strings.Contains(err.Error(), "拒绝当前配置") {
 		t.Fatalf("不认配置的版本应被拒绝，得到 %v", err)
 	}
@@ -338,7 +408,7 @@ func TestInstallRollsBackWhenServiceFailsToStart(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
-	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0")
+	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", "")
 	if err == nil {
 		t.Fatal("服务起不来时安装应失败")
 	}
@@ -375,12 +445,12 @@ func TestFailedInstallKeepsExistingRollbackPoint(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, service)
 	seed(t, binaryPath, "v1")
 
-	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2"); err != nil {
+	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2", ""); err != nil {
 		t.Fatal(err)
 	}
 	// 此刻回滚点是 v1。再装一个起不来的 v3，回滚点应当还是 v1。
 	service.failRestart = 2
-	if _, err := installer.Install(context.Background(), elf("v3"), upstream.SourceOfficial, "v3.0.0", "v3"); err == nil {
+	if _, err := installer.Install(context.Background(), elf("v3"), upstream.SourceOfficial, "v3.0.0", "v3", ""); err == nil {
 		t.Fatal("服务起不来时安装应失败")
 	}
 	backup, err := os.ReadFile(installer.backupPath)
@@ -406,7 +476,7 @@ func TestInstallDetectsCrashLoopWithinObservationWindow(t *testing.T) {
 	installer.interval = 0
 	seed(t, binaryPath, "v1")
 
-	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2")
+	_, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2", "")
 	if err == nil {
 		t.Fatal("观察窗口内服务反复重启，安装应失败")
 	}
@@ -424,7 +494,7 @@ func TestRollbackRestoresPreviousVersion(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
 
-	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceKdae, "30187784287", "d63a0c1"); err != nil {
+	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceKdae, "30187784287", "d63a0c1", ""); err != nil {
 		t.Fatal(err)
 	}
 	rolled, err := installer.Rollback(context.Background())
@@ -436,6 +506,27 @@ func TestRollbackRestoresPreviousVersion(t *testing.T) {
 	}
 	if !rolled.Present {
 		t.Fatalf("回滚后状态异常: %+v", rolled)
+	}
+}
+
+func TestRollbackRestoresPreviousAssetPlatform(t *testing.T) {
+	service := &fakeService{}
+	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, service)
+	seed(t, binaryPath, "v1")
+	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial,
+		"v2.0.0", "v2.0.0", "x86_64_v2_sse"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := installer.Install(context.Background(), elf("v3"), upstream.SourceKdae,
+		"30187784287", "d63a0c1", "x86_64_v3_avx2"); err != nil {
+		t.Fatal(err)
+	}
+	rolled, err := installer.Rollback(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rolled.Managed == nil || rolled.Managed.Platform != "x86_64_v2_sse" {
+		t.Fatalf("回滚后实际资产变体没有随上一版账本恢复: %+v", rolled.Managed)
 	}
 }
 
@@ -452,7 +543,7 @@ func TestStatusDetectsExternalReplacement(t *testing.T) {
 	service := &fakeService{}
 	installer, binaryPath := newTestInstaller(t, fetcher, service)
 	seed(t, binaryPath, "v1")
-	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0"); err != nil {
+	if _, err := installer.Install(context.Background(), elf("v2"), upstream.SourceOfficial, "v2.0.0", "v2.0.0", ""); err != nil {
 		t.Fatal(err)
 	}
 	if status := installer.Status(context.Background()); status.Drifted {
@@ -475,7 +566,7 @@ func TestStatusDetectsExternalReplacement(t *testing.T) {
 func TestInstallRejectsEmptyBinary(t *testing.T) {
 	installer, binaryPath := newTestInstaller(t, &fakeFetcher{}, &fakeService{})
 	seed(t, binaryPath, "v1")
-	if _, err := installer.Install(context.Background(), nil, upstream.SourceOfficial, "v1.0.0", "v1.0.0"); err == nil {
+	if _, err := installer.Install(context.Background(), nil, upstream.SourceOfficial, "v1.0.0", "v1.0.0", ""); err == nil {
 		t.Fatal("空内容应被拒绝")
 	}
 }

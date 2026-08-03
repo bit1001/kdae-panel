@@ -21,11 +21,13 @@ const router = createRouter({
       component: () => import('../layouts/AppLayout.vue'),
       children: [
         { path: '', name: 'dashboard', component: () => import('../views/DashboardView.vue'), meta: { title: '运行概览' } },
+        { path: 'connections', name: 'connections', component: () => import('../views/ConnectionsView.vue'), meta: { title: '连接活动' } },
         { path: 'proxy', name: 'orchestration', component: () => import('../views/OrchestrationView.vue'), meta: { title: '代理编排' } },
         { path: 'config', name: 'config', component: () => import('../views/ConfigView.vue'), meta: { title: '配置管理' } },
         { path: 'schema', name: 'schema', component: () => import('../views/SchemaView.vue'), meta: { title: '配置能力' } },
         { path: 'versions', name: 'versions', component: () => import('../views/VersionsView.vue'), meta: { title: 'dae 版本' } },
         { path: 'geo', name: 'geo', component: () => import('../views/GeoView.vue'), meta: { title: 'Geo 数据' } },
+        { path: 'diagnostics', name: 'diagnostics', component: () => import('../views/DiagnosticsView.vue'), meta: { title: '故障诊断' } },
         { path: 'logs', name: 'logs', component: () => import('../views/LogsView.vue'), meta: { title: '运行日志' } },
         { path: 'backups', name: 'backups', component: () => import('../views/BackupsView.vue'), meta: { title: '配置备份' } },
         { path: 'settings', name: 'settings', component: () => import('../views/SettingsView.vue'), meta: { title: '面板设置' } },

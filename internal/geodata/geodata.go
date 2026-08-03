@@ -4,9 +4,9 @@
 // 可执行文件也不碰 systemd 单元，因此不具备"面板缺陷升级为任意代码执行"的
 // 性质，不该逼着用户为了刷新 geo 而放宽二进制目录的写权限。
 //
-// 更新只需 dae reload，不必 restart：reload 会重建控制平面并重新编译路由规则，
-// 从而重读 geo 文件。这与替换二进制必须 restart（要重挂 eBPF）不同，
-// 因此更新 geo 不会中断现有连接。
+// dae 运行时只需 reload，不必 restart：reload 会重建控制平面并重新编译路由规则，
+// 从而重读 geo 文件；dae 未运行时则只需落盘，下次启动会直接读取。这与替换二进制
+// 必须 restart（要重挂 eBPF）不同。
 package geodata
 
 import (
@@ -45,10 +45,20 @@ type ServiceController interface {
 	Status(ctx context.Context) (host.Status, error)
 }
 
-// Reloader 让 dae 重新读取 geo 数据。
+// Reloader 让 dae 重新读取 geo 数据。显式 PID 用于 systemd 管理的运行中服务；
+// 无参数形式仅在无法取得服务状态的兼容场景使用。
 type Reloader interface {
 	Reload(ctx context.Context) error
+	ReloadPID(ctx context.Context, pid int) error
 }
+
+type ServiceState string
+
+const (
+	ServiceStateActive   ServiceState = "active"
+	ServiceStateInactive ServiceState = "inactive"
+	ServiceStateUnknown  ServiceState = "unknown"
+)
 
 // File 是一个 geo 数据文件的现状。
 type File struct {
@@ -61,6 +71,29 @@ type File struct {
 	// Shadowed 列出被 Path 遮蔽掉的同名文件。dae 只读优先级最高的那一份，
 	// 其余的既占磁盘又容易让人以为"更新了却没生效"。
 	Shadowed []string `json:"shadowed,omitempty"`
+	// TargetPath 是下一次更新这个文件时的落盘位置。两个 Geo 文件可能由 dae
+	// 从不同目录读取，因此不能再用一个公共目录代替。
+	TargetPath string `json:"targetPath"`
+}
+
+type ResidualKind string
+
+const (
+	ResidualTemporary ResidualKind = "temporary"
+	ResidualRollback  ResidualKind = "rollback"
+)
+
+// Residual 是异常退出后遗留的 Geo 事务文件。
+type Residual struct {
+	Path       string       `json:"path"`
+	Kind       ResidualKind `json:"kind"`
+	Size       int64        `json:"size"`
+	ModTime    time.Time    `json:"modTime"`
+	TargetPath string       `json:"targetPath,omitempty"`
+	// Restorable 表示正式文件缺失，回滚点是可直接恢复的旧数据。
+	Restorable bool `json:"restorable"`
+	// Deletable 表示它不承载唯一旧数据，可在用户确认后安全清理。
+	Deletable bool `json:"deletable"`
 }
 
 // Status 是 geo 数据的现状与可更新性。
@@ -69,17 +102,20 @@ type Status struct {
 	Sources []upstream.GeoSourceInfo `json:"sources"`
 	// DefaultSource 是界面该预选的来源：用过就沿用上次那个，否则用内置默认。
 	DefaultSource upstream.GeoSource `json:"defaultSource"`
-	// TargetDir 是本次更新会写入的目录，即 dae 实际读取的那个目录。
+	// TargetDir 为兼容旧客户端保留；两个文件同目录时返回该目录，分目录时为空。
 	TargetDir string `json:"targetDir"`
 	// SearchPath 是 dae 查找 geo 的完整顺序，便于用户理解为什么写这里。
-	SearchPath []string `json:"searchPath"`
-	Files      []File   `json:"files"`
+	SearchPath []string   `json:"searchPath"`
+	Files      []File     `json:"files"`
+	Residuals  []Residual `json:"residuals,omitempty"`
 	// Updatable 为假表示还不能更新，Problem 说明原因。
 	Updatable bool   `json:"updatable"`
 	Problem   string `json:"problem,omitempty"`
 	// Managed 记录面板上次更新到哪一版。
 	Managed  *State   `json:"managed,omitempty"`
 	Warnings []string `json:"warnings,omitempty"`
+	// ServiceState 决定更新后是立即 reload，还是等 dae 下次启动时读取。
+	ServiceState ServiceState `json:"serviceState"`
 }
 
 // State 记录面板上次把 geo 更新到了哪一版。
@@ -98,6 +134,12 @@ type Manager struct {
 	service    ServiceController
 	reloader   Reloader
 	logger     *slog.Logger
+}
+
+// ResidualManager 是 GeoService 可选的异常事务恢复能力。
+type ResidualManager interface {
+	CleanupResiduals(ctx context.Context) (Status, error)
+	RestoreResidual(ctx context.Context, path string) (Status, error)
 }
 
 type Options struct {

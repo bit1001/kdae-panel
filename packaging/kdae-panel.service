@@ -43,18 +43,22 @@ MemoryDenyWriteExecute=true
 RestrictRealtime=true
 RestrictNamespaces=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
-CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN
-AmbientCapabilities=CAP_KILL CAP_NET_ADMIN
-# 这些目录必须在服务启动前就存在：没有 "-" 前缀时，systemd 对不存在的路径
+# CAP_NET_RAW 只用于系统禁止普通 ping socket 时回退到 raw ICMP；
+# CAP_NET_ADMIN 仍用于 dae 绕行 Mark，CAP_KILL 用于向 dae MainPID 发送 reload 信号。
+CapabilityBoundingSet=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW
+AmbientCapabilities=CAP_KILL CAP_NET_ADMIN CAP_NET_RAW
+# 前四个目录必须在服务启动前就存在：没有 "-" 前缀时，systemd 对不存在的路径
 # 会直接放弃搭建挂载命名空间（226/NAMESPACE）。install.sh 负责建好它们，
 # 手工部署本单元时也要先建。不加 "-" 前缀是有意的：加了虽能启动，
 # 但 ProtectSystem=strict 下写入照样 EROFS，故障会推迟到运行时才暴露。
-ReadWritePaths=/etc/dae /var/lib/kdae-panel /usr/bin /etc/systemd/system
+# dae 的两个标准 Geo 目录可能只存在其一，或两个文件分处其中与 /etc/dae；前缀 "-"
+# 只让 systemd 在目录存在时开放写入，不会为了面板创建新的系统数据目录。
+ReadWritePaths=/etc/dae /var/lib/kdae-panel /usr/bin /etc/systemd/system -/usr/local/share/dae -/usr/share/dae
 # /usr/bin 与 /etc/systemd/system 让默认开启的 dae 版本管理可直接完成首次安装和
 # 版本切换。前者在 root 的 PATH 上，后者能定义以 root 运行的服务；不需要该功能的
 # 部署可关闭 KDAE_PANEL_ENABLE_DAE_INSTALL，并用 drop-in 收紧这些写路径。
 # dae 若实际位于其他目录，仍需按 systemctl show dae --property=ExecStart 追加该目录。
-# geo 数据写在配置目录（/etc/dae），已被上面覆盖，无需额外放宽。
+# 自定义 DAE_LOCATION_ASSET 不在标准目录内时，仍需用 drop-in 追加对应目录。
 
 [Install]
 WantedBy=multi-user.target

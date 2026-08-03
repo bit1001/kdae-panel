@@ -163,6 +163,26 @@ func TestReloadFailureRollsBackDiskConfig(t *testing.T) {
 	}
 }
 
+func TestInactiveServiceDefersReloadWithoutRollingBack(t *testing.T) {
+	controller := &fakeController{reloadErr: ErrReloadDeferred}
+	manager, entryPath := newTestManager(t, "current", controller)
+	document, err := manager.Read(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := manager.Save(context.Background(), "next start", document.Hash, true)
+	if err != nil {
+		t.Fatalf("停止状态保存不应失败: %v", err)
+	}
+	if !result.Applied || !result.Deferred || result.RolledBack {
+		t.Fatalf("延后生效状态异常: %+v", result)
+	}
+	content, err := os.ReadFile(entryPath)
+	if err != nil || string(content) != "next start" {
+		t.Fatalf("延后生效不应回滚磁盘配置: content=%q err=%v", content, err)
+	}
+}
+
 func TestListAndRestoreBackup(t *testing.T) {
 	controller := &fakeController{}
 	manager, _ := newTestManager(t, "version one", controller)
@@ -185,6 +205,143 @@ func TestListAndRestoreBackup(t *testing.T) {
 	restored, _ := manager.Read(context.Background())
 	if restored.Content != "version one" {
 		t.Fatalf("恢复后内容 = %q", restored.Content)
+	}
+}
+
+func TestPreviewBackupValidatesAndShowsDiffWithoutChangingConfiguration(t *testing.T) {
+	controller := &fakeController{}
+	manager, entryPath := newTestManager(t, "global {\n  log_level: info\n}\n", controller)
+	backup, err := manager.CreateBackup(context.Background(), "当前", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(entryPath, []byte("global {\n  log_level: warn\n}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	preview, err := manager.PreviewBackup(context.Background(), backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !preview.Valid || preview.Same || !preview.CurrentPresent || preview.CurrentHash == "" {
+		t.Fatalf("预览状态异常: %+v", preview)
+	}
+	var added, removed bool
+	for _, line := range preview.Diff {
+		added = added || line.Kind == "add" && strings.Contains(line.Text, "info")
+		removed = removed || line.Kind == "remove" && strings.Contains(line.Text, "warn")
+	}
+	if !added || !removed {
+		t.Fatalf("差异方向应为当前配置到存档配置: %+v", preview.Diff)
+	}
+	content, err := os.ReadFile(entryPath)
+	if err != nil || !strings.Contains(string(content), "warn") {
+		t.Fatalf("预览不应改动当前配置: %q, %v", content, err)
+	}
+	if len(controller.validatedContent) == 0 || controller.reloadCount != 0 {
+		t.Fatalf("预览应校验但不重载: validate=%v reload=%d", controller.validatedContent, controller.reloadCount)
+	}
+}
+
+func TestPreviewBackupReportsValidationFailure(t *testing.T) {
+	controller := &fakeController{}
+	manager, _ := newTestManager(t, "legacy backup", controller)
+	backup, err := manager.CreateBackup(context.Background(), "不可用", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.validateErr = errors.New("unknown field legacy_option")
+
+	preview, err := manager.PreviewBackup(context.Background(), backup.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if preview.Valid || !strings.Contains(preview.ValidationError, "legacy_option") {
+		t.Fatalf("应把校验失败作为预览结果返回: %+v", preview)
+	}
+}
+
+func TestCompareConfigLinesBoundsHugeLineCount(t *testing.T) {
+	content := []byte(strings.Repeat("\n", maxDiffInputLines+1))
+	lines, truncated := compareConfigLines(content, []byte("global {}\n"))
+	if !truncated || len(lines) != 1 || lines[0].Kind != "skip" {
+		t.Fatalf("超大差异应受限: truncated=%t lines=%+v", truncated, lines)
+	}
+}
+
+func TestNamedBackupCanBeEditedRestoredAndDeleted(t *testing.T) {
+	controller := &fakeController{}
+	manager, _ := newTestManager(t, "stable config", controller)
+
+	backup, err := manager.CreateBackup(context.Background(), " 稳定线路 ", " 切换前保留 ")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backup.Name != "稳定线路" || backup.Note != "切换前保留" {
+		t.Fatalf("存档信息未规范化: %+v", backup)
+	}
+	content, err := os.ReadFile(filepath.Join(manager.backupDir, backup.ID))
+	if err != nil || string(content) != "stable config" {
+		t.Fatalf("存档内容异常: content=%q err=%v", content, err)
+	}
+
+	updated, err := manager.UpdateBackup(context.Background(), backup.ID, "日常配置", "确认可用")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Name != "日常配置" || updated.Note != "确认可用" {
+		t.Fatalf("编辑后的信息异常: %+v", updated)
+	}
+	exported, err := manager.ExportBackup(context.Background(), backup.ID)
+	if err != nil || exported.Backup.Name != "日常配置" || string(exported.Content) != "stable config" {
+		t.Fatalf("导出存档异常: export=%+v err=%v", exported, err)
+	}
+	if _, err := manager.ExportBackup(context.Background(), "../config.dae"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("导出路径穿越错误 = %v", err)
+	}
+	listed, err := manager.ListBackups(context.Background())
+	if err != nil || len(listed) != 1 || listed[0].Name != "日常配置" {
+		t.Fatalf("列表未读回元数据: backups=%+v err=%v", listed, err)
+	}
+
+	manager.now = func() time.Time { return time.Date(2026, 7, 21, 1, 2, 4, 4, time.UTC) }
+	document, _ := manager.Read(context.Background())
+	if _, err := manager.Save(context.Background(), "temporary config", document.Hash, false); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := manager.Read(context.Background())
+	if _, err := manager.Restore(context.Background(), backup.ID, current.Hash, false); err != nil {
+		t.Fatal(err)
+	}
+	restored, _ := manager.Read(context.Background())
+	if restored.Content != "stable config" {
+		t.Fatalf("恢复内容 = %q", restored.Content)
+	}
+
+	if err := manager.DeleteBackup(context.Background(), backup.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(manager.backupDir, backup.ID)); !os.IsNotExist(err) {
+		t.Fatalf("存档内容未删除: %v", err)
+	}
+	if _, err := os.Stat(manager.backupMetadataPath(backup.ID)); !os.IsNotExist(err) {
+		t.Fatalf("存档元数据未删除: %v", err)
+	}
+}
+
+func TestBackupMetadataValidationAndTraversal(t *testing.T) {
+	manager, _ := newTestManager(t, "current", &fakeController{})
+	if _, err := manager.CreateBackup(context.Background(), "   ", ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("空名称错误 = %v", err)
+	}
+	if _, err := manager.CreateBackup(context.Background(), strings.Repeat("字", maxBackupNameRunes+1), ""); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("过长名称错误 = %v", err)
+	}
+	if _, err := manager.UpdateBackup(context.Background(), "../config.dae", "名称", ""); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("编辑路径穿越错误 = %v", err)
+	}
+	if err := manager.DeleteBackup(context.Background(), "../config.dae"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("删除路径穿越错误 = %v", err)
 	}
 }
 
@@ -226,6 +383,30 @@ func TestBackupRetentionRemovesOldestBackup(t *testing.T) {
 		if string(content) == "version one" {
 			t.Fatal("最旧备份没有被清理")
 		}
+	}
+}
+
+func TestBackupRetentionRemovesMetadataWithOldestBackup(t *testing.T) {
+	controller := &fakeController{}
+	dir := t.TempDir()
+	entryPath := filepath.Join(dir, "config.dae")
+	if err := os.WriteFile(entryPath, []byte("one"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := NewManagerWithBackupLimits(entryPath, filepath.Join(dir, "backups"), controller, 1, MaxConfigBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager.now = func() time.Time { return time.Date(2026, 7, 21, 1, 2, 3, 0, time.UTC) }
+	first, err := manager.CreateBackup(context.Background(), "第一份", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.Save(context.Background(), "two", hashBytes([]byte("one")), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(manager.backupMetadataPath(first.ID)); !os.IsNotExist(err) {
+		t.Fatalf("旧存档元数据应随内容清理: %v", err)
 	}
 }
 

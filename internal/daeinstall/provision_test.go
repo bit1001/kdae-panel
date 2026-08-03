@@ -28,11 +28,11 @@ WantedBy=multi-user.target
 
 func testBundle() upstream.Bundle {
 	return upstream.Bundle{
-		Binary:      elf("v1"),
-		Unit:        []byte(testUnit),
-		EmptyConfig: []byte(SeedConfig),
-		GeoIP:       []byte("geoip-data"),
-		GeoSite:     []byte("geosite-data"),
+		Platform: "x86_64_v2_sse",
+		Binary:   elf("v1"),
+		Unit:     []byte(testUnit),
+		GeoIP:    []byte("geoip-data"),
+		GeoSite:  []byte("geosite-data"),
 	}
 }
 
@@ -290,6 +290,10 @@ func TestFirstInstallLandsEveryArtifact(t *testing.T) {
 	if len(service.actions) != 1 || service.actions[0] != host.ActionDaemonReload {
 		t.Fatalf("应当只执行 daemon-reload，实际 %v", service.actions)
 	}
+	state, err := installer.readState()
+	if err != nil || state == nil || state.Platform != "x86_64_v2_sse" {
+		t.Fatalf("首次安装没有记录实际资产变体: state=%+v err=%v", state, err)
+	}
 	_ = status
 }
 
@@ -327,10 +331,9 @@ func TestFirstInstallRefusesToOverwriteExistingUnit(t *testing.T) {
 	}
 }
 
-func TestFirstInstallFallsBackToBuiltinSeedConfig(t *testing.T) {
+func TestFirstInstallUsesPanelSeedConfig(t *testing.T) {
 	installer, _, _ := newFreshInstaller(t)
 	bundle := testBundle()
-	bundle.EmptyConfig = nil // kdae 的构建不带 empty.dae
 
 	if _, err := installer.FirstInstall(context.Background(), bundle,
 		upstream.SourceKdae, "30187784287", "d63a0c1"); err != nil {
@@ -371,6 +374,11 @@ func TestFirstInstallRetryAfterDaemonReloadFailure(t *testing.T) {
 
 // 种子配置不能声明网卡，否则首次启动就会劫持流量、可能切断管理员自己的连接。
 func TestSeedConfigHijacksNothing(t *testing.T) {
+	for _, required := range []string{"dns {", "alidns:", "googledns:", "routing {"} {
+		if !strings.Contains(SeedConfig, required) {
+			t.Fatalf("种子配置缺少默认 DNS 内容 %s", required)
+		}
+	}
 	for _, forbidden := range []string{"wan_interface", "lan_interface"} {
 		if strings.Contains(SeedConfig, forbidden) {
 			t.Fatalf("种子配置不应包含 %s：它会让 dae 一启动就劫持流量", forbidden)

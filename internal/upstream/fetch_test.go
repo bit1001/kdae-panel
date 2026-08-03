@@ -46,6 +46,25 @@ func TestExtractBinaryFromRealReleaseLayout(t *testing.T) {
 	}
 }
 
+func TestBinaryOnlyExtractionSkipsFirstInstallMaterials(t *testing.T) {
+	archive := buildZip(t, map[string][]byte{
+		"dae-linux-x86_64": []byte("ELF-binary"),
+		"dae.service":      []byte("[Unit]"),
+		"geoip.dat":        []byte("geoip"),
+		"geosite.dat":      []byte("geosite"),
+	})
+	bundle, err := extractArchive(archive, false, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(bundle.Binary) != "ELF-binary" {
+		t.Fatalf("取出的内容 = %q", bundle.Binary)
+	}
+	if bundle.Unit != nil || bundle.GeoIP != nil || bundle.GeoSite != nil {
+		t.Fatalf("升级路径不应解压首次安装物料: %+v", bundle)
+	}
+}
+
 func TestExtractBinaryAcceptsPlainName(t *testing.T) {
 	archive := buildZip(t, map[string][]byte{
 		"dae":         []byte("ELF-binary"),
@@ -96,7 +115,8 @@ func TestEveryPlatformCandidateIsRecognizable(t *testing.T) {
 		"amd64", "386", "arm64", "arm", "riscv64", "loong64",
 		"s390x", "ppc64", "ppc64le", "mips", "mipsle", "mips64", "mips64le",
 	} {
-		platform, err := detectPlatform(goarch, flagSet("avx2", "sse4_2", "neon"))
+		flags := append(append([]string{"neon"}, x86V2Flags...), x86V3Flags...)
+		platform, err := detectPlatform(goarch, flagSet(flags...))
 		if err != nil {
 			t.Fatalf("%s: %v", goarch, err)
 		}

@@ -61,6 +61,26 @@ func (s stubConfigurationService) ListBackups(_ context.Context) ([]configstore.
 	return []configstore.Backup{}, nil
 }
 
+func (s stubConfigurationService) CreateBackup(_ context.Context, name, note string) (configstore.Backup, error) {
+	return configstore.Backup{Name: name, Note: note}, nil
+}
+
+func (s stubConfigurationService) UpdateBackup(_ context.Context, id, name, note string) (configstore.Backup, error) {
+	return configstore.Backup{ID: id, Name: name, Note: note}, nil
+}
+
+func (s stubConfigurationService) DeleteBackup(_ context.Context, _ string) error {
+	return nil
+}
+
+func (s stubConfigurationService) ExportBackup(_ context.Context, id string) (configstore.BackupExport, error) {
+	return configstore.BackupExport{Backup: configstore.Backup{ID: id}, Content: []byte("global {}")}, nil
+}
+
+func (s stubConfigurationService) PreviewBackup(_ context.Context, _ string) (configstore.BackupPreview, error) {
+	return configstore.BackupPreview{Valid: true, CurrentHash: s.document.Hash}, nil
+}
+
 func (s stubConfigurationService) Restore(_ context.Context, _, _ string, _ bool) (configstore.SaveResult, error) {
 	return configstore.SaveResult{}, nil
 }
@@ -71,6 +91,10 @@ func (s stubDaeService) Inspect(_ context.Context) dae.Report {
 
 func (s stubDaeService) Outline(_ context.Context) (dae.Outline, error) {
 	return s.outline, s.err
+}
+
+func (s stubDaeService) Validate(_ context.Context, _ string) error {
+	return s.err
 }
 
 func (s stubDaeService) Reload(_ context.Context) error {
@@ -266,6 +290,98 @@ func TestConfigurationConflictResponse(t *testing.T) {
 	}
 }
 
+func TestConfigurationBackupMetadataRoutes(t *testing.T) {
+	dir := t.TempDir()
+	entryPath := filepath.Join(dir, "config.dae")
+	if err := os.WriteFile(entryPath, []byte("global {}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configuration, err := configstore.NewManager(entryPath, filepath.Join(dir, "backups"), stubDaeService{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Configuration: configuration},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	create := httptest.NewRequest(http.MethodPost, "/api/v1/config/backups", strings.NewReader(`{"name":"稳定配置","note":"切换前"}`))
+	create.Header.Set("Content-Type", "application/json")
+	created := httptest.NewRecorder()
+	application.Handler().ServeHTTP(created, create)
+	if created.Code != http.StatusCreated {
+		t.Fatalf("创建存档状态码 = %d，响应 = %s", created.Code, created.Body.String())
+	}
+	var backup configstore.Backup
+	if err := json.NewDecoder(created.Body).Decode(&backup); err != nil {
+		t.Fatal(err)
+	}
+	if backup.Name != "稳定配置" || backup.Note != "切换前" || backup.ID == "" {
+		t.Fatalf("创建存档响应异常: %+v", backup)
+	}
+
+	update := httptest.NewRequest(http.MethodPut, "/api/v1/config/backups/"+url.PathEscape(backup.ID), strings.NewReader(`{"name":"日常配置","note":"已验证"}`))
+	update.Header.Set("Content-Type", "application/json")
+	updated := httptest.NewRecorder()
+	application.Handler().ServeHTTP(updated, update)
+	if updated.Code != http.StatusOK || !strings.Contains(updated.Body.String(), "日常配置") {
+		t.Fatalf("编辑存档响应异常: status=%d body=%s", updated.Code, updated.Body.String())
+	}
+
+	previewed := httptest.NewRecorder()
+	application.Handler().ServeHTTP(previewed, httptest.NewRequest(
+		http.MethodGet, "/api/v1/config/backups/"+url.PathEscape(backup.ID)+"/preview", nil))
+	if previewed.Code != http.StatusOK {
+		t.Fatalf("预览存档状态码 = %d，响应 = %s", previewed.Code, previewed.Body.String())
+	}
+	var preview configstore.BackupPreview
+	if err := json.NewDecoder(previewed.Body).Decode(&preview); err != nil {
+		t.Fatal(err)
+	}
+	if !preview.Valid || !preview.Same || preview.CurrentHash == "" || preview.Backup.ID != backup.ID {
+		t.Fatalf("预览存档响应异常: %+v", preview)
+	}
+
+	exported := httptest.NewRecorder()
+	application.Handler().ServeHTTP(exported, httptest.NewRequest(
+		http.MethodGet, "/api/v1/config/backups/"+url.PathEscape(backup.ID)+"/export", nil))
+	if exported.Code != http.StatusOK || exported.Body.String() != "global {}" {
+		t.Fatalf("导出存档响应异常: status=%d body=%q", exported.Code, exported.Body.String())
+	}
+	if disposition := exported.Header().Get("Content-Disposition"); !strings.Contains(disposition, "filename*=utf-8''%E6%97%A5%E5%B8%B8%E9%85%8D%E7%BD%AE.dae") {
+		t.Fatalf("导出文件名异常: %q", disposition)
+	}
+
+	deleted := httptest.NewRecorder()
+	application.Handler().ServeHTTP(deleted, httptest.NewRequest(
+		http.MethodDelete, "/api/v1/config/backups/"+url.PathEscape(backup.ID), nil))
+	if deleted.Code != http.StatusNoContent {
+		t.Fatalf("删除存档状态码 = %d，响应 = %s", deleted.Code, deleted.Body.String())
+	}
+	listed := httptest.NewRecorder()
+	application.Handler().ServeHTTP(listed, httptest.NewRequest(http.MethodGet, "/api/v1/config/backups", nil))
+	if listed.Code != http.StatusOK || listed.Body.String() != "[]\n" {
+		t.Fatalf("删除后列表异常: status=%d body=%s", listed.Code, listed.Body.String())
+	}
+}
+
+func TestBackupDownloadNameRemovesHeaderAndPathCharacters(t *testing.T) {
+	name := backupDownloadName(configstore.Backup{
+		ID:   "20260801.dae",
+		Name: "../../危险:\r\n配置?",
+	})
+	if name != "_.._危险___配置_.dae" {
+		t.Fatalf("下载文件名 = %q", name)
+	}
+	if strings.ContainsAny(name, "/\\:\r\n?\"<>|") {
+		t.Fatalf("下载文件名仍含非法字符: %q", name)
+	}
+}
+
 func TestServiceRestartAction(t *testing.T) {
 	hostService := &stubHostService{}
 	application, err := NewWithDependencies(
@@ -286,6 +402,137 @@ func TestServiceRestartAction(t *testing.T) {
 	}
 	if len(hostService.actions) != 1 || hostService.actions[0] != host.ActionRestart {
 		t.Fatalf("服务动作异常: %v", hostService.actions)
+	}
+}
+
+func TestServiceStartAndStopPersistBootState(t *testing.T) {
+	hostService := &stubHostService{}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Host: hostService},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, action := range []string{"start", "stop"} {
+		response := httptest.NewRecorder()
+		application.Handler().ServeHTTP(response, httptest.NewRequest(
+			http.MethodPost, "/api/v1/service/actions/"+action, nil))
+		if response.Code != http.StatusOK {
+			t.Fatalf("%s 状态码 = %d，响应 = %s", action, response.Code, response.Body.String())
+		}
+	}
+	want := []host.Action{host.ActionEnableNow, host.ActionDisableNow}
+	if !reflect.DeepEqual(hostService.actions, want) {
+		t.Fatalf("服务动作 = %v，期望 %v", hostService.actions, want)
+	}
+}
+
+func TestAdoptRunningServiceBootState(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	active := &stubHostService{status: host.Status{ActiveState: "active", UnitFileState: "disabled"}}
+	adoptRunningServiceBootState(active, logger)
+	if want := []host.Action{host.ActionEnable}; !reflect.DeepEqual(active.actions, want) {
+		t.Fatalf("运行中的旧服务迁移动作 = %v，期望 %v", active.actions, want)
+	}
+
+	for _, status := range []host.Status{
+		{ActiveState: "inactive", UnitFileState: "disabled"},
+		{ActiveState: "active", UnitFileState: "enabled"},
+	} {
+		service := &stubHostService{status: status}
+		adoptRunningServiceBootState(service, logger)
+		if len(service.actions) != 0 {
+			t.Fatalf("状态 %+v 不应被迁移，实际动作 %v", status, service.actions)
+		}
+	}
+}
+
+func TestServiceSuspendStateClearsAfterReload(t *testing.T) {
+	hostService := &stubHostService{status: host.Status{
+		Name:        "dae.service",
+		ActiveState: "active",
+		SubState:    "running",
+		MainPID:     42,
+	}}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{Dae: stubDaeService{}, Host: hostService},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	suspend := httptest.NewRecorder()
+	application.Handler().ServeHTTP(suspend,
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/suspend", nil))
+	if suspend.Code != http.StatusOK || !strings.Contains(suspend.Body.String(), "dae 已暂停") {
+		t.Fatalf("暂停响应异常: status=%d body=%s", suspend.Code, suspend.Body.String())
+	}
+
+	assertSuspended := func(want bool) {
+		t.Helper()
+		response := httptest.NewRecorder()
+		application.Handler().ServeHTTP(response,
+			httptest.NewRequest(http.MethodGet, "/api/v1/service", nil))
+		var payload struct {
+			Suspended bool `json:"suspended"`
+		}
+		if response.Code != http.StatusOK || json.NewDecoder(response.Body).Decode(&payload) != nil {
+			t.Fatalf("读取服务状态失败: status=%d body=%s", response.Code, response.Body.String())
+		}
+		if payload.Suspended != want {
+			t.Fatalf("suspended = %v，期望 %v", payload.Suspended, want)
+		}
+	}
+	assertSuspended(true)
+
+	// dae 被面板外部停止时，进程内的旧标记不能把未运行服务误报成暂停。
+	hostService.status.ActiveState = "inactive"
+	assertSuspended(false)
+	hostService.status.ActiveState = "active"
+	assertSuspended(false)
+	application.Handler().ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/suspend", nil))
+	assertSuspended(true)
+
+	reload := httptest.NewRecorder()
+	application.Handler().ServeHTTP(reload,
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/reload", nil))
+	if reload.Code != http.StatusOK {
+		t.Fatalf("重载响应异常: status=%d body=%s", reload.Code, reload.Body.String())
+	}
+	assertSuspended(false)
+
+	// 面板外发生的 systemd 重启不会经过动作端点，PID 变化也必须让旧状态失效。
+	application.Handler().ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/suspend", nil))
+	hostService.status.MainPID = 43
+	assertSuspended(false)
+}
+
+func TestServiceReloadDefersWhenDaeIsNotRunning(t *testing.T) {
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{
+			Dae:  stubDaeService{err: configstore.ErrReloadDeferred},
+			Host: &stubHostService{},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response := httptest.NewRecorder()
+	application.Handler().ServeHTTP(response,
+		httptest.NewRequest(http.MethodPost, "/api/v1/service/actions/reload", nil))
+	if response.Code != http.StatusOK ||
+		!strings.Contains(response.Body.String(), `"deferred":true`) ||
+		!strings.Contains(response.Body.String(), "下次启动") {
+		t.Fatalf("延后重载响应异常: status=%d body=%s", response.Code, response.Body.String())
 	}
 }
 
@@ -433,7 +680,10 @@ func (s *stubProbeService) Probe(_ context.Context, targets []netprobe.Target) (
 }
 
 func TestLatencyProbeEndpoint(t *testing.T) {
-	prober := &stubProbeService{results: []netprobe.Result{{Host: "example.com", Port: 443, Reachable: true, LatencyMs: 12.5}}}
+	prober := &stubProbeService{results: []netprobe.Result{{
+		Host: "example.com", Port: 443, Reachable: true, LatencyMs: 12.5,
+		ResolvedIP: "203.0.113.8", Method: "icmp",
+	}}}
 	application, err := NewWithDependencies(
 		Config{Version: "test-panel"},
 		slog.New(slog.NewTextHandler(io.Discard, nil)),
@@ -455,7 +705,8 @@ func TestLatencyProbeEndpoint(t *testing.T) {
 	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
 		t.Fatalf("解析响应失败: %v", err)
 	}
-	if len(response.Results) != 1 || !response.Results[0].Reachable || response.Results[0].LatencyMs != 12.5 {
+	if len(response.Results) != 1 || !response.Results[0].Reachable || response.Results[0].LatencyMs != 12.5 ||
+		response.Results[0].ResolvedIP != "203.0.113.8" || response.Results[0].Method != "icmp" {
 		t.Fatalf("响应内容异常: %+v", response.Results)
 	}
 	if len(prober.targets) != 1 || prober.targets[0].Host != "example.com" {
@@ -630,7 +881,7 @@ func (s *stubInstallService) Acquire(_ context.Context, _ upstream.Source, _, _ 
 	if s.release != nil {
 		<-s.release
 	}
-	bundle := upstream.Bundle{Binary: s.binary}
+	bundle := upstream.Bundle{Platform: "x86_64", Binary: s.binary}
 	if requireBundle {
 		bundle.Unit = []byte("dae.service")
 	}
@@ -642,12 +893,22 @@ func (s *stubInstallService) DeleteCached(source upstream.Source, ref string) er
 	return s.err
 }
 
+func (s *stubInstallService) Preflight(_ context.Context, _ []byte) (daeinstall.Compatibility, error) {
+	s.record("preflight")
+	if s.err != nil {
+		return daeinstall.Compatibility{}, s.err
+	}
+	return daeinstall.Compatibility{
+		Compatible: true, Version: "dae test", OutlineSupported: true, ConfigPresent: true,
+	}, nil
+}
+
 func (s *stubInstallService) FirstInstall(_ context.Context, _ upstream.Bundle, source upstream.Source, ref, _ string) (daeinstall.Status, error) {
 	s.record("first:" + string(source) + ":" + ref)
 	return s.status, s.err
 }
 
-func (s *stubInstallService) Install(_ context.Context, _ []byte, source upstream.Source, ref, _ string) (daeinstall.Status, error) {
+func (s *stubInstallService) Install(_ context.Context, _ []byte, source upstream.Source, ref, _, _ string) (daeinstall.Status, error) {
 	s.record(string(source) + ":" + ref)
 	return s.status, s.err
 }
@@ -682,6 +943,8 @@ func TestDaeInstallDisabledByDefault(t *testing.T) {
 		httptest.NewRequest(http.MethodGet, "/api/v1/dae/install", nil),
 		httptest.NewRequest(http.MethodGet, "/api/v1/dae/versions?source=official", nil),
 		httptest.NewRequest(http.MethodPost, "/api/v1/dae/install", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)),
+		httptest.NewRequest(http.MethodGet, "/api/v1/dae/compatibility", nil),
+		httptest.NewRequest(http.MethodPost, "/api/v1/dae/compatibility", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)),
 		httptest.NewRequest(http.MethodDelete, "/api/v1/dae/cache", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)),
 		httptest.NewRequest(http.MethodPost, "/api/v1/dae/rollback", nil),
 		httptest.NewRequest(http.MethodPost, "/api/v1/dae/uninstall", nil),
@@ -733,6 +996,36 @@ func TestDaeInstallRunsAsynchronously(t *testing.T) {
 	}
 	if job := awaitJobSettled(t, application); !job.Cached {
 		t.Fatalf("缓存命中应写进任务状态: %+v", job)
+	}
+}
+
+func TestDaeCompatibilityRunsAsynchronously(t *testing.T) {
+	service := &stubInstallService{
+		binary: []byte("v2"), cached: true, status: daeinstall.Status{Ready: true},
+	}
+	application := newInstallApp(t, service)
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/compatibility", strings.NewReader(`{"source":"official","ref":"v2.0.0","label":"v2.0.0"}`)))
+	if recorder.Code != http.StatusAccepted {
+		t.Fatalf("状态码 = %d，期望 202，响应 = %s", recorder.Code, recorder.Body.String())
+	}
+	job := awaitCompatibilitySettled(t, application)
+	if job.Phase != PhaseDone || job.Result == nil || !job.Result.Compatible || !job.Cached {
+		t.Fatalf("兼容性预检结果异常: %+v", job)
+	}
+	if records := service.records(); len(records) != 1 || records[0] != "preflight" {
+		t.Fatalf("预检调用 = %v", records)
+	}
+}
+
+func TestDaeCompatibilityRequiresExistingInstall(t *testing.T) {
+	application := newInstallApp(t, &stubInstallService{status: daeinstall.Status{Ready: false}})
+	recorder := httptest.NewRecorder()
+	application.Handler().ServeHTTP(recorder, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/compatibility", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)))
+	if recorder.Code != http.StatusConflict || !strings.Contains(recorder.Body.String(), "dae_not_installed") {
+		t.Fatalf("首次安装预检响应 = %d %s", recorder.Code, recorder.Body.String())
 	}
 }
 
@@ -972,6 +1265,29 @@ func awaitJobSettled(t *testing.T, application *App) Job {
 	}
 }
 
+func awaitCompatibilitySettled(t *testing.T, application *App) CompatibilityJob {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		recorder := httptest.NewRecorder()
+		application.Handler().ServeHTTP(recorder,
+			httptest.NewRequest(http.MethodGet, "/api/v1/dae/compatibility", nil))
+		var payload struct {
+			Job CompatibilityJob `json:"job"`
+		}
+		if err := json.NewDecoder(recorder.Body).Decode(&payload); err != nil {
+			t.Fatal(err)
+		}
+		if payload.Job.Phase != PhaseDownloading && payload.Job.Phase != PhaseApplying {
+			return payload.Job
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf("预检任务迟迟没有结束: %+v", payload.Job)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
 func TestDaeInstallRejectsConcurrentJobs(t *testing.T) {
 	release := make(chan struct{})
 	service := &stubInstallService{binary: []byte("v2"), release: release}
@@ -990,6 +1306,36 @@ func TestDaeInstallRejectsConcurrentJobs(t *testing.T) {
 	application.Handler().ServeHTTP(second, httptest.NewRequest(http.MethodPost, "/api/v1/dae/install", body()))
 	if second.Code != http.StatusConflict {
 		t.Fatalf("并发任务状态码 = %d，期望 409", second.Code)
+	}
+	close(release)
+}
+
+func TestDaeCompatibilityAndInstallShareOneTaskGate(t *testing.T) {
+	release := make(chan struct{})
+	service := &stubInstallService{
+		binary: []byte("v2"), release: release, status: daeinstall.Status{Ready: true},
+	}
+	application := newInstallApp(t, service)
+
+	preflight := httptest.NewRecorder()
+	application.Handler().ServeHTTP(preflight, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/compatibility", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)))
+	if preflight.Code != http.StatusAccepted {
+		t.Fatalf("预检状态码 = %d，响应 = %s", preflight.Code, preflight.Body.String())
+	}
+
+	install := httptest.NewRecorder()
+	application.Handler().ServeHTTP(install, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/install", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)))
+	if install.Code != http.StatusConflict || !strings.Contains(install.Body.String(), "version_task_in_progress") {
+		t.Fatalf("预检期间安装响应 = %d %s", install.Code, install.Body.String())
+	}
+
+	remove := httptest.NewRecorder()
+	application.Handler().ServeHTTP(remove, httptest.NewRequest(http.MethodDelete,
+		"/api/v1/dae/cache", strings.NewReader(`{"source":"official","ref":"v2.0.0"}`)))
+	if remove.Code != http.StatusConflict || !strings.Contains(remove.Body.String(), "version_task_in_progress") {
+		t.Fatalf("预检期间删除缓存响应 = %d %s", remove.Code, remove.Body.String())
 	}
 	close(release)
 }
@@ -1303,6 +1649,8 @@ type stubGeoService struct {
 	applied   int
 	requested upstream.GeoSource
 	custom    []upstream.CustomGeoSource
+	cleaned   int
+	restored  string
 }
 
 func (s *stubGeoService) Status(context.Context) geodata.Status { return s.status }
@@ -1330,6 +1678,20 @@ func (s *stubGeoService) Apply(context.Context, upstream.GeoData) (geodata.Statu
 	s.mu.Lock()
 	s.applied++
 	s.mu.Unlock()
+	return s.status, s.err
+}
+
+func (s *stubGeoService) CleanupResiduals(context.Context) (geodata.Status, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cleaned++
+	return s.status, s.err
+}
+
+func (s *stubGeoService) RestoreResidual(_ context.Context, path string) (geodata.Status, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restored = path
 	return s.status, s.err
 }
 
@@ -1618,6 +1980,29 @@ func TestGeoUpdateRejectsUnknownSource(t *testing.T) {
 	}
 }
 
+func TestGeoResidualRoutes(t *testing.T) {
+	service := &stubGeoService{status: geodata.Status{Residuals: []geodata.Residual{{
+		Path: "/etc/dae/geosite.dat.kdae-panel-previous", Kind: geodata.ResidualRollback,
+		TargetPath: "/etc/dae/geosite.dat", Restorable: true,
+	}}}}
+	application := newGeoApp(t, service)
+
+	cleanup := httptest.NewRecorder()
+	application.Handler().ServeHTTP(cleanup, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/geo/residuals/cleanup", nil))
+	if cleanup.Code != http.StatusOK || service.cleaned != 1 {
+		t.Fatalf("清理残留失败：%d %s", cleanup.Code, cleanup.Body.String())
+	}
+
+	restore := httptest.NewRecorder()
+	application.Handler().ServeHTTP(restore, httptest.NewRequest(http.MethodPost,
+		"/api/v1/dae/geo/residuals/restore",
+		strings.NewReader(`{"path":"/etc/dae/geosite.dat.kdae-panel-previous"}`)))
+	if restore.Code != http.StatusOK || service.restored != "/etc/dae/geosite.dat.kdae-panel-previous" {
+		t.Fatalf("恢复残留失败：%d %s", restore.Code, restore.Body.String())
+	}
+}
+
 func TestGeoCustomSourceCRUD(t *testing.T) {
 	service := &stubGeoService{status: geodata.Status{Updatable: true}}
 	application := newGeoApp(t, service)
@@ -1740,6 +2125,52 @@ func TestDaeInstallRequiresAuthentication(t *testing.T) {
 	}
 	if installed := service.records(); len(installed) != 0 {
 		t.Fatalf("未授权请求不应触发安装: %v", installed)
+	}
+}
+
+func TestDiagnosticReportRequiresAuthentication(t *testing.T) {
+	session := auth.Session{
+		Token: "session", CSRFToken: "csrf", ExpiresAt: time.Now().Add(time.Hour),
+		User: auth.User{ID: 1, Username: "admin"},
+	}
+	application, err := NewWithDependencies(
+		Config{Version: "test-panel"},
+		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Dependencies{
+			Dae:            stubDaeService{report: dae.Report{Available: true}},
+			Authentication: &stubAuthenticationService{initialized: true, session: session},
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	anonymous := httptest.NewRecorder()
+	application.Handler().ServeHTTP(anonymous, httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/report", nil))
+	if anonymous.Code != http.StatusUnauthorized {
+		t.Fatalf("未登录状态码 = %d", anonymous.Code)
+	}
+
+	request := httptest.NewRequest(http.MethodGet, "/api/v1/diagnostics/report", nil)
+	request.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.Token})
+	response := httptest.NewRecorder()
+	application.Handler().ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("诊断报告状态码 = %d，响应 = %s", response.Code, response.Body.String())
+	}
+	var payload struct {
+		Overall string `json:"overall"`
+		Counts  struct {
+			OK, Warning, Error, Unknown int
+		} `json:"counts"`
+		Items []json.RawMessage `json:"items"`
+	}
+	if err := json.NewDecoder(response.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	total := payload.Counts.OK + payload.Counts.Warning + payload.Counts.Error + payload.Counts.Unknown
+	if payload.Overall == "" || len(payload.Items) != 9 || total != len(payload.Items) {
+		t.Fatalf("诊断报告结构异常: overall=%q counts=%+v items=%d", payload.Overall, payload.Counts, len(payload.Items))
 	}
 }
 

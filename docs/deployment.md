@@ -88,7 +88,7 @@ sudo systemctl restart kdae-panel
 | `KDAE_PANEL_SYSTEMCTL` | `/usr/bin/systemctl` | systemctl 路径 |
 | `KDAE_PANEL_JOURNALCTL` | `/usr/bin/journalctl` | journalctl 路径 |
 | `KDAE_PANEL_DATABASE` | `/var/lib/kdae-panel/panel.db` | 认证数据库 |
-| `KDAE_PANEL_BACKUP_DIR` | `/var/lib/kdae-panel/backups` | 配置备份目录 |
+| `KDAE_PANEL_BACKUP_DIR` | `/var/lib/kdae-panel/backups` | 自动备份与手动配置存档目录；存档名称和备注位于对应的 `.meta.json` 文件 |
 | `KDAE_PANEL_SCHEDULE_FILE` | `/var/lib/kdae-panel/schedule.json` | 订阅自动刷新的设置与上次执行时间 |
 | `KDAE_PANEL_INSTALL_STATE_FILE` | `/var/lib/kdae-panel/dae-install.json` | dae 版本安装记录，同目录还存放回滚点与 `dae-versions/` 本地版本库 |
 | `KDAE_PANEL_GITHUB_TOKEN_FILE` | `/var/lib/kdae-panel/github-token` | 设置页保存 GitHub API Token 的独立文件，权限 `0600` |
@@ -112,7 +112,9 @@ sudo systemctl restart kdae-panel
 
 不需要版本管理的部署可以把 `KDAE_PANEL_ENABLE_DAE_INSTALL` 改为 `false`，并用 systemd drop-in 收紧上述写目录。允许写 root 的可执行文件和服务单元意味着面板缺陷可能升级为任意代码执行，这是默认便利性所接受的权限代价。
 
-首次安装会写入可执行文件、geo 数据、服务单元，以及一份不劫持任何流量的种子配置（仅在配置不存在时）。**它不会自动启动 dae**——请先在配置管理页写好规则再手动启动，否则透明代理可能切断你当前的连接。已存在的服务单元与配置一律不覆盖。
+首次安装会写入可执行文件、geo 数据、服务单元，以及一份带默认 DNS 但不声明网卡的种子配置（仅在配置不存在时）。**它不会自动启动 dae**——请先在配置管理页写好规则再手动启动，否则透明代理可能切断你当前的连接。已存在的服务单元与配置一律不覆盖；旧配置缺少 `dns` 节时，配置页面只生成待保存草稿，不会在打开页面时静默改磁盘。
+
+服务控制页的启动与停止同时决定下一次系统启动后的状态：启动使用 `systemctl enable --now`，停止使用 `systemctl disable --now`。版本安装、切换和回滚仍使用普通的瞬时启停动作，只恢复事务开始前的运行状态，不会擅自改变开机策略。升级自旧版面板后，若 dae 当时正在运行但单元仍为 `disabled`，面板启动时会自动补成开机启动；已经停止的服务不会被自动启动。
 
 版本页也可以卸载 dae。确认框分别提供“同时删除主配置文件”和“同时删除面板可见的全部 geo 数据副本”两个选项，默认都不勾选；因此常规卸载只删除面板管理的 dae 可执行文件、标准路径下的 systemd 单元和版本回滚记录，配置、订阅与 geo 数据默认保留。选择删除的数据会进入同一个可回滚事务。受面板沙箱隐藏的 `/root/.local/share/dae` 无法代为删除，界面会明确说明。为避免误删包管理器或用户手工维护的程序，没有面板安装记录、二进制摘要已经漂移，或服务单元不在标准路径时，自动卸载会被拒绝。
 
@@ -149,7 +151,7 @@ systemd 单元或 env 模板；这些配套文件仍属于最近一次完整安�
 
 侧栏的「Geo 数据」是独立入口，不需要开启 dae 版本管理，也不再要求修改环境文件。旧部署残留的 `KDAE_PANEL_ENABLE_GEO_UPDATE=false` 只作为兼容参数接受，不会隐藏页面。
 
-通常不需要额外放宽 `ReadWritePaths`：面板更新的是 dae **当前实际读取**的那份 geo，而它多半就在配置目录（已经可写）。若你的 geo 在 `/usr/local/share/dae`（例如用 `dae-installer` 装的），界面会明确提示该目录不可写以及要追加哪一条。
+通常不需要额外放宽 `ReadWritePaths`：面板会分别更新 dae **当前实际读取**的两份 geo，它们可以位于不同目录。默认单元已经允许 `/etc/dae` 以及存在时的 `/usr/local/share/dae`、`/usr/share/dae`；只有 `DAE_LOCATION_ASSET` 指向其他自定义目录时，界面才会提示需要显式加入该目录。
 
 界面内置两个来源：
 
@@ -161,7 +163,9 @@ systemd 单元或 env 模板；这些配套文件仍属于最近一次完整安�
 两点务必知悉：
 
 - **切换来源会改变路由行为。** 两套规则集里同名分类所含的域名不同，切换后 `geosite:` 开头的路由规则匹配的范围会变，而 dae 不会因此报错。界面只在切换时警告，沿用同一来源不会反复打扰。
-- **更新会触发 `dae reload`。** 新连接不受影响，但进行中的长连接（大文件下载、SSH、串流）最多约 10 秒后可能被断开。若 dae 不接受新数据，面板会自动还原旧文件并重新加载。
+- **dae 运行时会触发 `dae reload <MainPID>`。** PID 直接取自 systemd，不依赖 `/var/run/dae.pid`。新连接不受影响，但进行中的长连接（大文件下载、SSH、串流）最多约 10 秒后可能被断开。若 dae 不接受新数据，面板会自动还原旧文件并重新加载。dae 未运行时只更新文件，下一次启动会读取新数据；由于此时无法通过 reload 检查配置引用的 Geo 分类，若新数据仍缺少分类，下一次启动仍会失败。
+
+若主机在更新中断电或面板被强制终止，Geo 页面会列出未完成事务。超过一小时的 Geo 专属暂存文件可安全清理；`.kdae-panel-previous` 回滚点在正式文件缺失时提供“恢复缺失文件”，正式文件仍在时才允许用户确认清理。未处理的回滚点会阻止下一次更新，避免唯一旧数据被新事务覆盖。
 
 「来源管理」可以添加多组自定义来源，分别填写 `geoip.dat`、`geosite.dat` 与各自的 SHA-256 校验文件直链。只接受公网 HTTPS；每次重定向都重新检查解析地址，自定义下载不携带 GitHub Token，也不能关闭校验。链接可能带查询参数，因此配置单独保存在权限 `0600` 的 `KDAE_PANEL_GEO_SOURCES_FILE`，不会进入配置历史或普通日志。
 

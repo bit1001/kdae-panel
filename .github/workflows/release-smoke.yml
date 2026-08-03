@@ -309,6 +309,8 @@ jobs:
           read_write_paths=$(grep '^ReadWritePaths=' <<<"${unit}")
           grep -Fq ' /usr/bin ' <<<" ${read_write_paths#ReadWritePaths=} "
           grep -Fq ' /etc/systemd/system ' <<<" ${read_write_paths#ReadWritePaths=} "
+          capabilities=$(grep '^CapabilityBoundingSet=' <<<"${unit}")
+          grep -Fqw 'CAP_NET_RAW' <<<"${capabilities}"
 
       - name: 服务应处于运行状态
         run: |

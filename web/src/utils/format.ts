@@ -1,4 +1,4 @@
-export function formatBytes(value?: number): string {
+export function formatBytes(value?: number, precision?: number): string {
   if (value === undefined || !Number.isFinite(value)) return '—'
   if (value < 1024) return `${value} B`
   const units = ['KiB', 'MiB', 'GiB', 'TiB']
@@ -8,15 +8,19 @@ export function formatBytes(value?: number): string {
     current /= 1024
     unit = units[index]
   }
-  return `${current >= 100 ? current.toFixed(0) : current.toFixed(1)} ${unit}`
+  return `${current.toFixed(precision ?? (current >= 100 ? 0 : 1))} ${unit}`
 }
 
-export function formatDurationNanoseconds(value?: number): string {
-  if (value === undefined || !Number.isFinite(value)) return '—'
-  const seconds = Math.floor(value / 1_000_000_000)
+export function formatElapsedSince(value?: string, now = Date.now()): string {
+  if (!value || !Number.isFinite(now)) return '—'
+  const startedAt = Date.parse(value)
+  if (!Number.isFinite(startedAt) || startedAt > now) return '—'
+  const seconds = Math.floor((now - startedAt) / 1000)
+  const days = Math.floor(seconds / 86400)
   const hours = Math.floor(seconds / 3600)
   const minutes = Math.floor((seconds % 3600) / 60)
   const remaining = seconds % 60
+  if (days > 0) return `${days} 天 ${Math.floor((seconds % 86400) / 3600)} 小时`
   if (hours > 0) return `${hours} 小时 ${minutes} 分`
   if (minutes > 0) return `${minutes} 分 ${remaining} 秒`
   return `${remaining} 秒`
@@ -40,4 +44,3 @@ export function formatDateTime(value?: string): string {
 export function shortHash(value?: string): string {
   return value ? value.slice(0, 12) : '—'
 }
-

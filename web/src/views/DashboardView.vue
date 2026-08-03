@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import {
   NAlert,
   NButton,
@@ -25,7 +25,7 @@ import {
 import { RouterLink } from 'vue-router'
 import { APIError, getJSON, postJSON } from '../api/client'
 import type { ConfigDocument, DaeReport, ServiceStatus } from '../types/api'
-import { formatBytes, formatDurationNanoseconds } from '../utils/format'
+import { formatBytes, formatElapsedSince } from '../utils/format'
 import { parseGroups, parseRoutingRules, readSection } from '../utils/daeconf'
 
 const message = useMessage()
@@ -38,11 +38,18 @@ const configContent = ref<string | null>(null)
 const serviceError = ref('')
 const daeError = ref('')
 const configError = ref('')
+const now = ref(Date.now())
+let clockTimer: number | undefined
 
 const running = computed(() => service.value?.activeState === 'active')
-const statusType = computed(() => running.value ? 'success' : service.value?.activeState === 'failed' ? 'error' : 'warning')
-const statusLabel = computed(() => running.value ? '运行中' : service.value?.activeState === 'failed' ? '运行失败' : '未运行')
+const suspended = computed(() => service.value?.suspended === true)
+const statusType = computed(() => suspended.value ? 'warning' : running.value ? 'success' : service.value?.activeState === 'failed' ? 'error' : 'warning')
+const statusLabel = computed(() => suspended.value ? '已暂停' : running.value ? '运行中' : service.value?.activeState === 'failed' ? '运行失败' : '未运行')
 const supportedCommands = computed(() => Object.entries(dae.value?.commands || {}).filter(([, enabled]) => enabled).map(([name]) => name))
+const uptime = computed(() => running.value
+  ? formatElapsedSince(service.value?.startedAt || service.value?.activeSince, now.value)
+  : '—')
+const startsOnBoot = computed(() => service.value?.unitFileState === 'enabled')
 
 const orchestration = computed(() => {
   const text = configContent.value
@@ -93,8 +100,8 @@ async function refresh(silent = false) {
 async function runAction(action: string) {
   actionLoading.value = action
   try {
-    await postJSON(`/api/v1/service/actions/${action}`)
-    message.success(`${actionName(action)}已执行`)
+    const result = await postJSON<{ message?: string }>(`/api/v1/service/actions/${action}`)
+    message.success(result.message || `${actionName(action)}已执行`)
     await new Promise((resolve) => window.setTimeout(resolve, 500))
     await refresh(true)
   } catch (error) {
@@ -108,7 +115,14 @@ function actionName(action: string): string {
   return ({ start: '启动', stop: '停止', restart: '重启', reload: '重载', suspend: '暂停' } as Record<string, string>)[action] || action
 }
 
-onMounted(() => void refresh())
+onMounted(() => {
+  void refresh()
+  clockTimer = window.setInterval(() => { now.value = Date.now() }, 1000)
+})
+
+onBeforeUnmount(() => {
+  if (clockTimer !== undefined) window.clearInterval(clockTimer)
+})
 </script>
 
 <template>
@@ -126,38 +140,36 @@ onMounted(() => void refresh())
 
     <NAlert v-if="serviceError" type="error" closable @close="serviceError = ''">{{ serviceError }}</NAlert>
     <NAlert v-if="daeError" type="warning" closable @close="daeError = ''">{{ daeError }}</NAlert>
+    <NAlert v-if="suspended" type="warning" :bordered="false" class="service-suspended-alert">
+      <div class="service-suspended-copy">
+        <strong>dae 已暂停</strong>
+        <span>代理流量处理已停止，但 dae 进程仍在运行；点击“无损重载”即可恢复。</span>
+      </div>
+    </NAlert>
 
-    <NGrid responsive="screen" cols="1 s:2 l:4" :x-gap="14" :y-gap="14">
+    <NGrid responsive="screen" cols="1 s:3" :x-gap="14" :y-gap="14">
       <NGridItem>
         <NCard class="metric-card" size="small">
           <NText depth="3">服务状态</NText>
           <NSkeleton v-if="loading" text style="width: 60%" />
           <div v-else class="metric-value"><NTag :type="statusType" round>{{ statusLabel }}</NTag></div>
-          <small>{{ service?.subState || '等待状态数据' }}</small>
+          <small>{{ suspended ? '代理流量处理已暂停' : service?.subState || '等待状态数据' }}</small>
         </NCard>
       </NGridItem>
       <NGridItem>
         <NCard class="metric-card" size="small">
           <NText depth="3">内存占用</NText>
           <NSkeleton v-if="loading" text style="width: 65%" />
-          <strong v-else class="metric-value">{{ formatBytes(service?.memoryBytes) }}</strong>
+          <strong v-else class="metric-value">{{ formatBytes(service?.memoryBytes, 1) }}</strong>
           <small>{{ service?.tasks ?? '—' }} 个任务</small>
         </NCard>
       </NGridItem>
       <NGridItem>
         <NCard class="metric-card" size="small">
-          <NText depth="3">累计 CPU</NText>
+          <NText depth="3">本次运行时长</NText>
           <NSkeleton v-if="loading" text style="width: 65%" />
-          <strong v-else class="metric-value">{{ formatDurationNanoseconds(service?.cpuUsageNanoseconds) }}</strong>
+          <strong v-else class="metric-value">{{ uptime }}</strong>
           <small>主进程 PID {{ service?.mainPid || '—' }}</small>
-        </NCard>
-      </NGridItem>
-      <NGridItem>
-        <NCard class="metric-card" size="small">
-          <NText depth="3">重启次数</NText>
-          <NSkeleton v-if="loading" text style="width: 40%" />
-          <strong v-else class="metric-value">{{ service?.restarts ?? '—' }}</strong>
-          <small>退出状态 {{ service?.execMainStatus ?? '—' }}</small>
         </NCard>
       </NGridItem>
     </NGrid>
@@ -165,7 +177,14 @@ onMounted(() => void refresh())
     <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2 xl:3" :x-gap="16" :y-gap="16">
       <NGridItem>
         <NCard title="服务控制" class="panel-card">
-          <template #header-extra><NTag size="small" :type="statusType">{{ service?.name || 'dae' }}</NTag></template>
+          <template #header-extra>
+            <NSpace size="small" align="center">
+              <NTag size="small" :type="startsOnBoot ? 'success' : 'default'">
+                {{ startsOnBoot ? '随系统启动' : '不随系统启动' }}
+              </NTag>
+              <NTag size="small" :type="statusType">{{ service?.name || 'dae' }}</NTag>
+            </NSpace>
+          </template>
           <NSpace wrap>
             <NButton type="success" :disabled="actionLoading !== '' || running" :loading="actionLoading === 'start'" @click="runAction('start')">
               <template #icon><NIcon><PlayOutline /></NIcon></template>启动
@@ -183,7 +202,7 @@ onMounted(() => void refresh())
             </NPopconfirm>
             <NPopconfirm positive-text="确认暂停" negative-text="取消" @positive-click="runAction('suspend')">
               <template #trigger>
-                <NButton :disabled="actionLoading !== '' || !running" :loading="actionLoading === 'suspend'">
+                <NButton :disabled="actionLoading !== '' || !running || suspended" :loading="actionLoading === 'suspend'">
                   <template #icon><NIcon><PauseOutline /></NIcon></template>暂停
                 </NButton>
               </template>

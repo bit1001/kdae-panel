@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, h, onBeforeUnmount, onMounted, ref } from 'vue'
+import { computed, h, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { RouterLink, useRoute, useRouter } from 'vue-router'
 import {
   NAlert,
   NAvatar,
   NButton,
+  NDrawer,
+  NDrawerContent,
   NIcon,
   NLayout,
   NLayoutContent,
@@ -24,23 +26,46 @@ import {
   GitNetworkOutline,
   GridOutline,
   LogOutOutline,
+  MenuOutline,
+  PulseOutline,
   ReaderOutline,
   SettingsOutline,
+  SwapHorizontalOutline,
 } from '@vicons/ionicons5'
 import { getJSON } from '../api/client'
 import type { PanelUpdatePayload, PanelUpdateStatus } from '../types/api'
 import PanelUpdateAction from '../components/PanelUpdateAction.vue'
+import { useMobileViewport } from '../composables/useMobileViewport'
 import { useAuthStore } from '../stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const auth = useAuthStore()
 const message = useMessage()
-const collapsed = ref(window.innerWidth < 900)
+const mobile = useMobileViewport()
+const drawerVisible = ref(false)
+const mobileNavRef = ref<HTMLElement | null>(null)
+const viewportWidth = ref(window.innerWidth)
+const drawerWidth = computed(() => Math.min(320, Math.round(viewportWidth.value * 0.86)))
+const collapsed = ref(window.innerWidth < 1100)
+
+interface MenuRouterLinkSlot {
+  href: string
+  isExactActive: boolean
+  navigate: (event?: MouseEvent) => Promise<unknown>
+}
 
 function menuLink(label: string, name: string, icon: typeof GridOutline): MenuOption {
   return {
-    label: () => h(RouterLink, { to: { name } }, { default: () => label }),
+    // 选中态由 NMenu 的 value 统一管理。使用 RouterLink 的 custom 模式，避免根路径
+    // 在所有子页面上保留 router-link-active，形成第二套相互矛盾的活动状态。
+    label: () => h(RouterLink, { to: { name }, custom: true }, {
+      default: ({ href, isExactActive, navigate }: MenuRouterLinkSlot) => h('a', {
+        href,
+        'aria-current': isExactActive ? 'page' : undefined,
+        onClick: navigate,
+      }, label),
+    }),
     key: name,
     icon: () => h(NIcon, null, { default: () => h(icon) }),
   }
@@ -48,11 +73,13 @@ function menuLink(label: string, name: string, icon: typeof GridOutline): MenuOp
 
 const menuOptions: MenuOption[] = [
   menuLink('运行概览', 'dashboard', GridOutline),
+  menuLink('连接活动', 'connections', SwapHorizontalOutline),
   menuLink('代理编排', 'orchestration', GitNetworkOutline),
   menuLink('配置管理', 'config', DocumentTextOutline),
   menuLink('配置能力', 'schema', CodeSlashOutline),
   menuLink('dae 版本', 'versions', CubeOutline),
   menuLink('Geo 数据', 'geo', EarthOutline),
+  menuLink('故障诊断', 'diagnostics', PulseOutline),
   menuLink('运行日志', 'logs', ReaderOutline),
   menuLink('配置备份', 'backups', ArchiveOutline),
   menuLink('面板设置', 'settings', SettingsOutline),
@@ -77,8 +104,18 @@ function handleExpired() {
 }
 
 function handleResize() {
-  if (window.innerWidth < 900) collapsed.value = true
+  viewportWidth.value = window.innerWidth
+  if (!mobile.value && window.innerWidth < 1100) collapsed.value = true
 }
+
+function focusSelectedMobileMenuItem() {
+  // 抽屉默认会聚焦第一项，让非当前页的“运行概览”出现灰色焦点底色。
+  mobileNavRef.value
+    ?.querySelector<HTMLAnchorElement>('.n-menu-item-content--selected a')
+    ?.focus({ preventScroll: true })
+}
+
+watch(mobile, () => { drawerVisible.value = false })
 
 // 新版本提醒：后端带缓存，这里每次进入布局查一次即可。
 // 检查失败保持沉默——提醒是锦上添花，不该因为 GitHub 不可达而打扰使用。
@@ -112,8 +149,10 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <NLayout has-sider class="app-shell">
+  <NLayout :has-sider="!mobile" class="app-shell">
     <NLayoutSider
+      v-if="!mobile"
+      class="app-sidebar"
       bordered
       collapse-mode="width"
       :collapsed-width="64"
@@ -133,11 +172,57 @@ onBeforeUnmount(() => {
       <NMenu :value="selectedKey" :collapsed="collapsed" :collapsed-width="64" :collapsed-icon-size="22" :options="menuOptions" />
     </NLayoutSider>
 
-    <NLayout>
+    <NDrawer
+      v-model:show="drawerVisible"
+      placement="left"
+      :width="drawerWidth"
+      :auto-focus="false"
+      @after-enter="focusSelectedMobileMenuItem"
+    >
+      <NDrawerContent class="mobile-nav-drawer" :native-scrollbar="false" body-content-style="padding: 0;">
+        <div class="brand mobile-drawer-brand">
+          <div class="brand-mark">K</div>
+          <div class="brand-copy">
+            <strong>kdae-panel</strong>
+            <span>零侵入管理面板</span>
+          </div>
+        </div>
+        <div ref="mobileNavRef">
+          <NMenu :value="selectedKey" :options="menuOptions" @update:value="drawerVisible = false" />
+        </div>
+        <template #footer>
+          <div class="mobile-drawer-account">
+            <NAvatar round size="small">{{ auth.user?.username?.slice(0, 1).toUpperCase() }}</NAvatar>
+            <div class="account-copy">
+              <strong>{{ auth.user?.username }}</strong>
+              <span>管理员</span>
+            </div>
+            <NButton quaternary circle title="退出登录" aria-label="退出登录" @click="logout">
+              <template #icon><NIcon><LogOutOutline /></NIcon></template>
+            </NButton>
+          </div>
+        </template>
+      </NDrawerContent>
+    </NDrawer>
+
+    <NLayout class="app-main">
       <NLayoutHeader bordered class="app-header">
-        <div>
-          <NText depth="3" class="eyebrow">KDAE CONTROL PLANE</NText>
-          <h1>{{ title }}</h1>
+        <div class="app-header-leading">
+          <NButton
+            v-if="mobile"
+            quaternary
+            circle
+            class="mobile-nav-trigger"
+            title="打开导航"
+            aria-label="打开导航"
+            @click="drawerVisible = true"
+          >
+            <template #icon><NIcon><MenuOutline /></NIcon></template>
+          </NButton>
+          <div class="app-title">
+            <NText depth="3" class="eyebrow">KDAE CONTROL PLANE</NText>
+            <h1>{{ title }}</h1>
+          </div>
         </div>
         <div class="account">
           <NAvatar round size="small">{{ auth.user?.username?.slice(0, 1).toUpperCase() }}</NAvatar>
@@ -150,7 +235,7 @@ onBeforeUnmount(() => {
           </NButton>
         </div>
       </NLayoutHeader>
-      <NLayoutContent class="app-content" content-style="padding: 28px;">
+      <NLayoutContent class="app-content" content-style="padding: var(--page-padding);">
         <NAlert
           v-if="update?.check.updateAvailable && !updateDismissed"
           type="info"

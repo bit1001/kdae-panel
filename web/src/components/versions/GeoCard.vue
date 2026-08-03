@@ -15,11 +15,20 @@ import {
   useDialog,
   useMessage,
 } from 'naive-ui'
-import { AddOutline, CloudDownloadOutline, CreateOutline, LinkOutline, TimerOutline, TrashOutline } from '@vicons/ionicons5'
+import {
+  AddOutline,
+  CloudDownloadOutline,
+  CreateOutline,
+  LinkOutline,
+  ReturnUpBackOutline,
+  TimerOutline,
+  TrashOutline,
+} from '@vicons/ionicons5'
 import { APIError, deleteJSON, getJSON, postJSON, putJSON } from '../../api/client'
 import type {
   CustomGeoSource,
   CustomGeoSourceInput,
+  GeoResidual,
   GeoSource,
   GeoStatus,
   InstallJob,
@@ -39,6 +48,10 @@ const geoDisabled = ref(false)
 const geoError = ref('')
 const geoSource = ref<GeoSource | null>(null)
 const geoBusy = computed(() => geoJob.value?.phase === 'downloading' || geoJob.value?.phase === 'applying')
+const residualBusy = ref(false)
+const safeResidualCount = computed(() =>
+  (geoStatus.value?.residuals || []).filter((item) => item.deletable).length,
+)
 const activeGeoSource = computed(
   () => geoStatus.value?.sources.find((item) => item.source === geoSource.value) || null,
 )
@@ -46,12 +59,22 @@ const geoSourceOptions = computed(() => (geoStatus.value?.sources || []).map((it
   label: item.custom ? `${item.label}（自定义）` : item.label,
   value: item.source,
 })))
+const geoTargetSummary = computed(() => {
+  const files = geoStatus.value?.files || []
+  const directories = [...new Set(files.map((file) => file.targetPath.replace(/[\\/][^\\/]+$/, '')))]
+  if (directories.length === 1) return directories[0]
+  return files.map((file) => `${file.name} 写入 ${file.targetPath}`).join('；')
+})
 
 const geoPolling = useJobPolling({
   refresh: () => loadGeo(),
   phase: () => geoJob.value?.phase,
   onSettled: (phase) => {
-    if (phase === 'done') message.success('geo 数据已更新并生效')
+    if (phase === 'done') {
+      message.success(geoStatus.value?.serviceState === 'inactive'
+        ? 'geo 数据已更新，dae 启动后生效'
+        : 'geo 数据已更新')
+    }
     else if (phase === 'failed') message.error(geoJob.value?.error || 'geo 更新失败')
   },
 })
@@ -83,17 +106,29 @@ function confirmUpdateGeo() {
   // 沿用同一个来源只是把数据往前推，把警告一并甩出去反而稀释了真正的风险。
   const previous = geoStatus.value?.managed?.source
   const switching = previous !== undefined && previous !== geoSource.value
+  const serviceState = geoStatus.value?.serviceState
+  const activation = serviceState === 'inactive'
+    ? '当前 dae 未运行，因此不会执行 reload；文件会在 dae 下次启动时读取。面板此时无法检查配置引用的 Geo 分类是否存在，若新数据仍缺少分类，dae 下次启动仍会失败。'
+    : serviceState === 'active'
+      ? '随后会使用 systemd MainPID 执行 dae reload 让它立即生效。'
+      : '面板暂时无法确认 dae 是否运行，将尝试使用 dae 默认 PID 文件执行 reload。'
   dialog.warning({
     title: `更新 geo 数据（${chosen?.label || geoSource.value}）`,
     content: `面板会从 ${repositories} 下载 geoip.dat 与 geosite.dat，逐个比对 sha256，`
-      + `写入 ${geoStatus.value?.targetDir}，然后执行 dae reload 让它生效。`
+      + `写入 ${geoTargetSummary.value}。${activation}`
       + (switching
         ? '⚠ 这次会切换到另一套规则集：geosite: 开头的路由规则所匹配的域名集合会随之改变，'
-          + '同名分类内容变化时 dae 不会报错；若新来源完全没有配置引用的分类，reload 会失败，'
-          + '面板会还原旧数据并指出缺失分类。请确认你的路由规则在新规则集下仍然成立。'
+          + (serviceState === 'inactive'
+            ? '同名分类内容变化时 dae 不会报错；请确认你的路由规则在新规则集下仍然成立。'
+            : '同名分类内容变化时 dae 不会报错；若新来源完全没有配置引用的分类，reload 会失败，'
+              + '面板会还原旧数据并指出缺失分类。请确认你的路由规则在新规则集下仍然成立。')
         : '')
-      + 'reload 不会中断新连接，但进行中的长连接（大文件下载、SSH、串流）最多约 10 秒后可能被断开；'
-      + '若 dae 不接受新数据，面板会自动还原成原来的 geo 并重新加载。',
+      + (serviceState === 'active'
+        ? 'reload 不会中断新连接，但进行中的长连接（大文件下载、SSH、串流）最多约 10 秒后可能被断开；'
+        : '')
+      + (serviceState === 'inactive'
+        ? ''
+        : '若 dae 不接受新数据，面板会自动还原成原来的 geo 并重新加载。'),
     positiveText: '下载并更新',
     negativeText: '取消',
     onPositiveClick: updateGeo,
@@ -112,6 +147,56 @@ async function updateGeo() {
       await loadGeo()
       if (geoBusy.value) geoPolling.start()
     }
+  }
+}
+
+function confirmCleanupResiduals() {
+  dialog.warning({
+    title: '清理 Geo 事务残留',
+    content: `将删除 ${safeResidualCount.value} 个不再承载唯一旧数据的文件。正式文件缺失时的回滚点会保留，不会被清理。`,
+    positiveText: '确认清理',
+    negativeText: '取消',
+    onPositiveClick: cleanupResiduals,
+  })
+}
+
+async function cleanupResiduals() {
+  residualBusy.value = true
+  try {
+    const payload = await postJSON<{ status: GeoStatus }>('/api/v1/dae/geo/residuals/cleanup')
+    geoStatus.value = payload.status
+    message.success('Geo 事务残留已清理')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '清理 Geo 事务残留失败')
+    await loadGeo()
+  } finally {
+    residualBusy.value = false
+  }
+}
+
+function confirmRestoreResidual(residual: GeoResidual) {
+  dialog.warning({
+    title: '恢复旧 Geo 文件',
+    content: `正式文件 ${residual.targetPath} 当前缺失。面板会把保留的旧数据恢复到原位；dae 正在运行时会随后 reload。`,
+    positiveText: '恢复旧文件',
+    negativeText: '取消',
+    onPositiveClick: () => restoreResidual(residual),
+  })
+}
+
+async function restoreResidual(residual: GeoResidual) {
+  residualBusy.value = true
+  try {
+    const payload = await postJSON<{ status: GeoStatus }>('/api/v1/dae/geo/residuals/restore', {
+      path: residual.path,
+    })
+    geoStatus.value = payload.status
+    message.success('旧 Geo 文件已恢复')
+  } catch (error) {
+    message.error(error instanceof Error ? error.message : '恢复旧 Geo 文件失败')
+    await loadGeo()
+  } finally {
+    residualBusy.value = false
   }
 }
 
@@ -324,7 +409,7 @@ onMounted(async () => {
       正在下载并校验 geo 数据…
     </NAlert>
     <NAlert v-else-if="geoJob?.phase === 'applying'" type="warning" :bordered="false" class="card-alert">
-      正在写入并重新加载 dae…
+      {{ geoStatus?.serviceState === 'inactive' ? '正在写入 Geo 文件…' : '正在写入并重新加载 dae…' }}
     </NAlert>
     <NAlert v-else-if="geoJob?.phase === 'failed'" type="error" :bordered="false" class="card-alert">
       上次更新失败：{{ geoJob.error }}
@@ -341,6 +426,55 @@ onMounted(async () => {
     >
       {{ warning }}
     </NAlert>
+    <NAlert
+      v-if="geoStatus?.residuals?.length"
+      :type="geoStatus.residuals.some((item) => item.kind === 'rollback') ? 'error' : 'warning'"
+      :bordered="false"
+      class="card-alert"
+    >
+      <div class="geo-residual-head">
+        <div>
+          <strong>发现未完成的 Geo 文件事务</strong>
+          <div class="geo-residual-copy">请先恢复唯一旧数据，或确认当前正式文件正常后清理残留。</div>
+        </div>
+        <NButton
+          v-if="safeResidualCount > 0"
+          size="small"
+          secondary
+          :loading="residualBusy"
+          :disabled="geoBusy"
+          @click="confirmCleanupResiduals"
+        >
+          <template #icon><NIcon><TrashOutline /></NIcon></template>
+          清理安全残留
+        </NButton>
+      </div>
+      <div class="geo-residual-list">
+        <div v-for="residual in geoStatus.residuals" :key="residual.path" class="geo-residual-row">
+          <div class="geo-residual-info">
+            <div>
+              <NTag size="small" :type="residual.kind === 'rollback' ? 'error' : 'warning'" :bordered="false">
+                {{ residual.kind === 'rollback' ? '回滚点' : '暂存文件' }}
+              </NTag>
+              <span>{{ formatBytes(residual.size) }} · {{ formatDateTime(residual.modTime) }}</span>
+            </div>
+            <div class="mono geo-path">{{ residual.path }}</div>
+          </div>
+          <NButton
+            v-if="residual.restorable"
+            size="small"
+            secondary
+            :loading="residualBusy"
+            :disabled="geoBusy"
+            @click="confirmRestoreResidual(residual)"
+          >
+            <template #icon><NIcon><ReturnUpBackOutline /></NIcon></template>
+            恢复缺失文件
+          </NButton>
+          <NText v-else-if="!residual.deletable" depth="3">需要在主机上人工检查</NText>
+        </div>
+      </div>
+    </NAlert>
 
     <dl v-if="geoStatus" class="details-list">
       <div v-for="file in geoStatus.files" :key="file.name">
@@ -352,6 +486,9 @@ onMounted(async () => {
             <div class="mono geo-path">{{ file.path }}</div>
           </template>
           <NText v-else depth="3">未安装</NText>
+          <div v-if="file.targetPath !== file.path" class="geo-target-path">
+            下次写入：<span class="mono">{{ file.targetPath }}</span>
+          </div>
         </dd>
       </div>
       <div>
@@ -394,14 +531,16 @@ onMounted(async () => {
     </div>
 
     <NText depth="3" class="geo-hint">
-      更新只需 dae reload，不必重启：新连接不受影响，但进行中的长连接最多约 10 秒后可能被断开。
+      dae 运行时只 reload、不重启；未运行时只更新文件并在下次启动时读取。
+      reload 不影响新连接，但进行中的长连接最多约 10 秒后可能被断开。
       不同来源的规则集不一定相同，切换会改变 <code class="mono">geosite:</code>
-      规则匹配的域名集合；同名分类内容变化不会报错，分类完全不存在则会回滚并明确提示。
+      规则匹配的域名集合；同名分类内容变化不会报错。运行中的 dae 会在分类不存在时回滚并明确提示，
+      未运行时只能等下次启动检查。
     </NText>
 
     <NModal v-model:show="scheduleVisible" preset="card" title="geo 数据自动更新" class="orchestrate-modal">
       <NText depth="3">
-        到点后面板会重新下载校验并只 reload 不重启。来源沿用当前面板记录的那一个，
+        到点后面板会重新下载校验；dae 运行时只 reload 不重启，未运行时留待下次启动读取。来源沿用当前面板记录的那一个，
         绝不会自动切换规则集；若有其他控制操作正在执行，本轮跳过并在几分钟后重试。
       </NText>
       <NAlert v-if="scheduleError" type="error" :bordered="false" class="card-alert schedule-alert">

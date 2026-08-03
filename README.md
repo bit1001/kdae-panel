@@ -6,32 +6,48 @@
 
 ## 界面预览
 
-| 运行概览 | 代理编排 |
-| :--: | :--: |
-| ![运行概览](docs/screenshots/dashboard.png) | ![代理编排](docs/screenshots/orchestration.png) |
+<table>
+  <tr>
+    <td colspan="2" width="33%" align="center"><strong>运行概览</strong><br><img width="100%" src="docs/screenshots/dashboard.png" alt="运行概览"></td>
+    <td colspan="2" width="33%" align="center"><strong>连接活动</strong><br><img width="100%" src="docs/screenshots/connections.png" alt="连接活动"></td>
+    <td colspan="2" width="33%" align="center"><strong>代理编排</strong><br><img width="100%" src="docs/screenshots/orchestration.png" alt="代理编排"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>配置管理</strong><br><img width="100%" src="docs/screenshots/config.png" alt="配置管理"></td>
+    <td colspan="2" align="center"><strong>动态配置能力</strong><br><img width="100%" src="docs/screenshots/schema.png" alt="动态配置能力"></td>
+    <td colspan="2" align="center"><strong>dae 版本管理</strong><br><img width="100%" src="docs/screenshots/versions.png" alt="dae 版本管理"></td>
+  </tr>
+  <tr>
+    <td colspan="2" align="center"><strong>Geo 数据管理</strong><br><img width="100%" src="docs/screenshots/geo.png" alt="Geo 数据管理"></td>
+    <td colspan="2" align="center"><strong>故障诊断</strong><br><img width="100%" src="docs/screenshots/diagnostics.png" alt="故障诊断"></td>
+    <td colspan="2" align="center"><strong>运行日志</strong><br><img width="100%" src="docs/screenshots/logs.png" alt="运行日志"></td>
+  </tr>
+  <tr>
+    <td colspan="3" width="50%" align="center"><strong>配置备份</strong><br><img width="100%" src="docs/screenshots/backups.png" alt="配置备份"></td>
+    <td colspan="3" width="50%" align="center"><strong>面板设置</strong><br><img width="100%" src="docs/screenshots/settings.png" alt="面板设置"></td>
+  </tr>
+</table>
 
-| dae 版本管理 | 登录 |
-| :--: | :--: |
-| ![dae 版本管理](docs/screenshots/versions.png) | ![登录](docs/screenshots/login.png) |
-
-*截图来自本地演示环境，节点、订阅与延迟均为示例数据。*
+*截图由当前代码的 Playwright 演示环境生成，页面状态、连接、节点、订阅、日志、诊断与延迟均为示例数据。*
 
 ## 功能
 
 - 通过 `dae export outline` 动态发现当前版本的配置结构；
-- systemd / OpenWrt procd 服务状态、启动、停止和重启（自动检测）；
+- systemd / OpenWrt procd 服务状态、启动、停止和重启（自动检测）；面板启动 dae 时同步设为随系统启动，停止时同步取消，系统重启后保持最后一次面板控制的状态；
 - dae 无损重载、暂停和 sysdump 诊断；
-- `global`、节点、订阅、分组与路由的可视化编排：全局设置覆盖 dae 当前公开的字段，实际支持项和默认值由本机二进制的 `export outline` 动态确认，不兼容字段会明确标记；支持分享链接批量导入、订阅与分组过滤条件编辑、逐条路由编辑，以及 GFW/中国列表/全局/MAC 常用路由模板；复杂规则可直接在当前页面编辑对应节原文，注释与未涉及的配置节保持不变；
+- `global`、DNS、节点、订阅、分组与路由的可视化编排：全局设置与 DNS 覆盖 dae 当前公开的字段，实际支持项和默认值由本机二进制的 `export outline` 动态确认，不兼容字段会明确标记；DNS 提供上游、请求/响应路由、缓存、监听地址和固定 TTL 编辑，以及彼此独立的简单/进阶草稿；同时支持分享链接批量导入并自动生成稳定节点标签、导入时加入已有分组、按本地节点、订阅节点或整份订阅维护分组成员、逐条路由编辑，以及 GFW/中国列表/全局/MAC 常用路由模板；复杂内容可直接在当前页面编辑对应节原文，注释与未涉及的配置节保持不变；
 - 订阅离线缓存开关（dae 的 `-file` 持久化）、立即刷新与按间隔自动刷新；
-- 在官方 dae 发布与 kdae 分支 CI 构建之间安装、切换、回滚或卸载，安装前校验并在失败时自动恢复；下载过的二进制会保存在本地版本库，后续切换无需联网，并可逐个清理；机器上没有 dae 时可完成首次安装，卸载时可分别选择保留或删除配置与 geo 数据（默认保留，版本管理默认开启）；GitHub 元数据带短时缓存与并发合并，设置页可安全填写只读 Token 以避开匿名接口低额度；
-- 独立的 Geo 数据管理页：一键更新、文件状态与路径、每天到每 30 天的定时更新；内置 Loyalsoldier 与 v2fly，也可保存多组自定义公网 HTTPS 直链；两个文件逐一校验 SHA-256、就地替换 dae 实际读取的那一份、只 reload 不重启，失败自动还原，来源沿用上次且绝不静默切换规则集；
+- 在官方 dae 发布与 kdae 分支 CI 构建之间安装、切换、回滚或卸载；点击“预检并切换”会直接进入一次完整事务，目标二进制只有通过 ELF、版本、公开命令及当前配置兼容性校验后才会替换当前版本，失败自动恢复；下载过的二进制会保存在本地版本库，后续切换无需联网，并可逐个清理；机器上没有 dae 时可完成首次安装，卸载时可分别选择保留或删除配置与 geo 数据（默认保留，版本管理默认开启）；GitHub 元数据带短时缓存与并发合并，设置页可安全填写只读 Token 以避开匿名接口低额度；
+- 独立的 Geo 数据管理页：一键更新、文件状态与路径、异常事务恢复、每天到每 30 天的定时更新；内置 Loyalsoldier 与 v2fly，也可保存多组自定义公网 HTTPS 直链；两个文件逐一校验 SHA-256，即使分处不同目录也各自原位更新并共同回滚，运行中按 systemd MainPID reload，未运行则在下次启动时生效，来源沿用上次且绝不静默切换规则集；
 - 面板自身的新版本提醒：读取本仓库最新发布并长时缓存，设置页支持立即检查，可用 `KDAE_PANEL_DISABLE_UPDATE_CHECK` 整体关闭；
 - 面板一键自升级：默认开启，可在设置页直接开关；校验 sha256、用新二进制自证可运行后再替换并重启自身，保留上一版供人工还原；
-- 面板主机侧的节点 TCP 直连延迟探测；
+- 节点入口延迟探测：公网使用不经过 dae TCP/UDP 转发的 ICMP 三次中位数，内网使用 TCP；不靠延迟阈值猜测，也不以可能经过当前代理的结果兜底；
+- 连接活动：以 dae 的 info 日志展示最近 24 小时内有界的连接建立流水，按目标、客户端、节点与出站组聚合并可直接筛选明细；客户端有有效 MAC 时跨 IP 合并。dae 当前持有的 TCP/UDP socket、最近 30 秒已采样峰值与远端分布作为独立快照呈现；未捕获不会被误写成“没有流量”，也不读取内部 eBPF Map 或伪造逐条存活状态、流量和速率；
 - 原始配置编辑、独立校验、并发冲突检测和事务保存；
 - 保存前备份、原子替换及重载失败后的磁盘回滚；
-- 配置历史浏览与指定版本恢复；
-- journald 结构化日志浏览、搜索和级别筛选；
+- 配置历史存档：可为当前配置保存名称和备注，恢复前展示与当前配置的逐行差异，并用当前 dae 预先校验兼容性；不兼容存档禁止恢复，真正恢复时仍再次校验并受乐观锁保护；存档支持原文导出、单份删除和多选批量删除，自动备份仍按 50 份、256 MiB 上限自动清理；
+- 故障诊断中心：聚合 systemd 状态、dae 公开能力、当前配置校验、Geo 文件、网络接口、默认路由、Linux 内核、eBPF 基础条件与近期异常日志；单项探测失败不会中断整份报告，正常 reload 生命周期日志不会被误报为故障；
+- journald 结构化日志浏览、搜索和精确级别筛选；页面同时显示并可修改 dae 实际输出级别，修改仍经过配置校验、原子保存与 reload；
 - SQLite 管理员账户、Argon2id 密码摘要和服务端会话；
 - SameSite/HttpOnly Cookie、CSRF 校验、同源检查和登录限速；
 - Vue 3 响应式管理界面，前端资源嵌入单个 Go 二进制；

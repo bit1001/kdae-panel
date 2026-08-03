@@ -104,8 +104,8 @@ func (m *procdManager) Logs(ctx context.Context, limit int) ([]LogEntry, error) 
 	if limit <= 0 {
 		limit = 200
 	}
-	if limit > maxLogLines {
-		limit = maxLogLines
+	if limit > MaxLogLines {
+		limit = MaxLogLines
 	}
 	result, err := m.run(ctx, "logread", "-l", strconv.Itoa(limit))
 	if err != nil {

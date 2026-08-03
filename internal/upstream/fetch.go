@@ -30,25 +30,51 @@ const (
 
 // Bundle 是发布包里首次安装用得上的全部物料。
 //
-// 官方发布包不只有可执行文件,还平铺着 systemd 单元、最小配置与两个 geo 数据
+// 官方发布包不只有可执行文件,还平铺着 systemd 单元与两个 geo 数据
 // 文件。它们全都被同一个 sha256 覆盖,因此首次安装不需要引入任何新的下载源
 // 或信任根——这比另外去取 geo 数据安全得多。
 type Bundle struct {
-	Binary []byte
+	// Platform 是解出此二进制的实际资产变体。
+	Platform string
+	Binary   []byte
 	// Unit 是发布包自带的 dae.service,可能不存在。
-	Unit []byte
-	// EmptyConfig 是 empty.dae:`global {} routing {}`。
-	// 它不配置任何网卡,因此 dae 起来后不劫持任何流量,适合做首次安装的种子配置。
-	EmptyConfig []byte
-	GeoIP       []byte
-	GeoSite     []byte
+	Unit    []byte
+	GeoIP   []byte
+	GeoSite []byte
 }
 
 // FetchBundle 下载资产、比对 sha256 并取出其中全部可用物料。
 // 校验不通过时返回错误且不产出任何内容——调用方据此保证只有可信字节进入后续流程。
 func (r *Registry) FetchBundle(ctx context.Context, asset Asset) (Bundle, error) {
+	payload, err := r.fetchAsset(ctx, asset)
+	if err != nil {
+		return Bundle{}, err
+	}
+	bundle, err := extractArchive(payload, asset.Nested, true)
+	if err != nil {
+		return Bundle{}, err
+	}
+	bundle.Platform = asset.Platform
+	return bundle, nil
+}
+
+// FetchBinary 供已有 dae 的升级与切换使用。发布包仍须完整下载并校验，
+// 但无需再解压首次安装才会用到的服务单元和几十兆 geo 数据。
+func (r *Registry) FetchBinary(ctx context.Context, asset Asset) ([]byte, error) {
+	payload, err := r.fetchAsset(ctx, asset)
+	if err != nil {
+		return nil, err
+	}
+	bundle, err := extractArchive(payload, asset.Nested, false)
+	if err != nil {
+		return nil, err
+	}
+	return bundle.Binary, nil
+}
+
+func (r *Registry) fetchAsset(ctx context.Context, asset Asset) ([]byte, error) {
 	if asset.SHA256 == "" {
-		return Bundle{}, errors.New("资产缺少校验和，拒绝下载")
+		return nil, errors.New("资产缺少校验和，拒绝下载")
 	}
 	limit := int64(MaxAssetBytes)
 	if asset.Size > 0 && asset.Size < limit {
@@ -57,12 +83,12 @@ func (r *Registry) FetchBundle(ctx context.Context, asset Asset) (Bundle, error)
 	}
 	payload, err := r.client.download(ctx, asset.URL, limit)
 	if err != nil {
-		return Bundle{}, err
+		return nil, err
 	}
 	if err := verifyDigest(payload, asset.SHA256); err != nil {
-		return Bundle{}, err
+		return nil, err
 	}
-	return extractBundle(payload, asset.Nested)
+	return payload, nil
 }
 
 func verifyDigest(payload []byte, expected string) error {
@@ -77,6 +103,12 @@ func verifyDigest(payload []byte, expected string) error {
 // extractBundle 从发布包中取出全部可用物料。
 // 只有可执行文件是必需的，其余缺失时留空由调用方决定如何应对。
 func extractBundle(payload []byte, nested bool) (Bundle, error) {
+	return extractArchive(payload, nested, true)
+}
+
+// extractArchive 的 includeExtras 为假时只读取二进制条目。zip 目录仍会完整校验，
+// 但不会为升级路径解压和分配首次安装物料。
+func extractArchive(payload []byte, nested, includeExtras bool) (Bundle, error) {
 	if nested {
 		inner, err := extractInnerArchive(payload)
 		switch {
@@ -99,7 +131,6 @@ func extractBundle(payload []byte, nested bool) (Bundle, error) {
 	var binaryEntry *zip.File
 	extras := map[string]*[]byte{
 		"dae.service": &bundle.Unit,
-		"empty.dae":   &bundle.EmptyConfig,
 		"geoip.dat":   &bundle.GeoIP,
 		"geosite.dat": &bundle.GeoSite,
 	}
@@ -116,7 +147,7 @@ func extractBundle(payload []byte, nested bool) (Bundle, error) {
 			binaryEntry = file
 			continue
 		}
-		if target, ok := extras[name]; ok && *target == nil {
+		if target, ok := extras[name]; includeExtras && ok && *target == nil {
 			content, err := readZipEntry(file, maxExtraBytes)
 			if err != nil {
 				return Bundle{}, err
@@ -134,9 +165,9 @@ func extractBundle(payload []byte, nested bool) (Bundle, error) {
 }
 
 // extractBinary 只取发布包里的可执行文件，供测试直接调用。
-// 生产路径一律走 extractBundle：解包逻辑只有一份，不会分叉。
+// 生产路径的 FetchBinary 也复用 extractArchive，解包逻辑不会分叉。
 func extractBinary(payload []byte, nested bool) ([]byte, error) {
-	bundle, err := extractBundle(payload, nested)
+	bundle, err := extractArchive(payload, nested, false)
 	if err != nil {
 		return nil, err
 	}

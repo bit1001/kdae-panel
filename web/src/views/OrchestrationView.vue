@@ -22,7 +22,9 @@ import {
 import { APIError, getJSON, postJSON, putJSON } from '../api/client'
 import type { ConfigDocument, ConfigSaveResult } from '../types/api'
 import { readSection } from '../utils/daeconf'
+import { defaultConfiguration, withDefaultDNS } from '../utils/dns'
 import GlobalCard from '../components/orchestration/GlobalCard.vue'
+import DNSCard from '../components/orchestration/DNSCard.vue'
 import NodesCard from '../components/orchestration/NodesCard.vue'
 import SubscriptionsCard from '../components/orchestration/SubscriptionsCard.vue'
 import GroupsCard from '../components/orchestration/GroupsCard.vue'
@@ -41,6 +43,7 @@ const content = ref('')
 const originalContent = ref('')
 const validationMessage = ref('')
 const validationError = ref('')
+const dnsDraftAdded = ref(false)
 
 const dirty = computed(() => content.value !== originalContent.value)
 const unparsedLines = computed(
@@ -54,16 +57,19 @@ async function load() {
   loading.value = true
   validationMessage.value = ''
   validationError.value = ''
+  dnsDraftAdded.value = false
   try {
     const loaded = await getJSON<ConfigDocument>('/api/v1/config')
     document.value = loaded
-    content.value = loaded.content
+    content.value = withDefaultDNS(loaded.content)
     originalContent.value = loaded.content
+    dnsDraftAdded.value = content.value !== loaded.content
   } catch (error) {
     if (error instanceof APIError && error.status === 404) {
       document.value = null
-      content.value = ''
+      content.value = defaultConfiguration()
       originalContent.value = ''
+      dnsDraftAdded.value = true
     } else {
       message.error(error instanceof Error ? error.message : '读取配置失败')
     }
@@ -101,6 +107,7 @@ async function save(apply: boolean) {
       apply,
     })
     originalContent.value = submitted
+    dnsDraftAdded.value = false
     document.value = {
       path: document.value?.path || '/etc/dae/config.dae',
       content: submitted,
@@ -109,7 +116,11 @@ async function save(apply: boolean) {
       mode: document.value?.mode || '-rw-------',
       modifiedAt: result.savedAt,
     }
-    validationMessage.value = apply ? '编排结果已保存并完成无损重载' : '编排结果已保存，尚未应用到运行进程'
+    validationMessage.value = !apply
+      ? '编排结果已保存，尚未应用到运行进程'
+      : result.deferred
+        ? '编排结果已保存；dae 当前未运行，下次启动时生效'
+        : '编排结果已保存并完成无损重载'
     message.success(validationMessage.value)
   } catch (error) {
     if (error instanceof APIError && error.status === 409) {
@@ -155,19 +166,19 @@ onMounted(() => void load())
     <div class="page-toolbar">
       <div>
         <h2>代理编排</h2>
-        <NText depth="3">可视化编辑全局设置、节点、订阅、分组与路由，未涉及的配置和注释保持原样</NText>
+        <NText depth="3">可视化编辑全局设置、DNS、节点、订阅、分组与路由，未涉及的配置和注释保持原样</NText>
       </div>
-      <NSpace>
+      <NSpace class="orchestration-toolbar-actions">
         <NButton secondary :disabled="loading" @click="load">
           <template #icon><NIcon><RefreshOutline /></NIcon></template>重新读取
         </NButton>
         <NButton :loading="validating" :disabled="loading" @click="validate">
           <template #icon><NIcon><CheckmarkCircleOutline /></NIcon></template>校验
         </NButton>
-        <NButton :loading="saving" :disabled="loading || !dirty" @click="save(false)">
+        <NButton class="desktop-only" :loading="saving" :disabled="loading || !dirty" @click="save(false)">
           <template #icon><NIcon><SaveOutline /></NIcon></template>仅保存
         </NButton>
-        <NButton type="primary" :loading="saving" :disabled="loading || !dirty" @click="confirmReload">
+        <NButton class="desktop-only" type="primary" :loading="saving" :disabled="loading || !dirty" @click="confirmReload">
           <template #icon><NIcon><CloudUploadOutline /></NIcon></template>保存并重载
         </NButton>
       </NSpace>
@@ -175,6 +186,9 @@ onMounted(() => void load())
 
     <NAlert v-if="validationMessage" type="success" closable @close="validationMessage = ''">{{ validationMessage }}</NAlert>
     <NAlert v-if="validationError" type="error" closable @close="validationError = ''"><pre class="error-detail">{{ validationError }}</pre></NAlert>
+    <NAlert v-if="dnsDraftAdded" type="info" :bordered="false">
+      检测到入口配置缺少 dns 节，已把默认 DNS 加入当前编排草稿；尚未写入磁盘，保存后才会生效。
+    </NAlert>
     <NAlert v-if="!loading && !document && !dirty" type="info" :bordered="false">
       入口配置尚不存在。在这里导入节点或添加订阅即可从零生成，保存时会自动创建配置文件。
     </NAlert>
@@ -189,6 +203,7 @@ onMounted(() => void load())
     <NSpin :show="loading">
       <div class="page-stack">
         <GlobalCard v-model="content" />
+        <DNSCard v-model="content" />
         <NodesCard v-model="content" />
 
         <NGrid class="equal-height-grid" responsive="screen" cols="1 l:2" :x-gap="16" :y-gap="16">
@@ -203,5 +218,14 @@ onMounted(() => void load())
         <RoutingCard v-model="content" />
       </div>
     </NSpin>
+
+    <div class="mobile-save-bar" aria-label="编排保存操作">
+      <NButton :loading="saving" :disabled="loading || !dirty" @click="save(false)">
+        <template #icon><NIcon><SaveOutline /></NIcon></template>仅保存
+      </NButton>
+      <NButton type="primary" :loading="saving" :disabled="loading || !dirty" @click="confirmReload">
+        <template #icon><NIcon><CloudUploadOutline /></NIcon></template>保存并重载
+      </NButton>
+    </div>
   </div>
 </template>
