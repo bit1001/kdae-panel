@@ -54,7 +54,12 @@ func (m *procdManager) Status(ctx context.Context) (Status, error) {
 		MainPID:     pid,
 		UnitPath:    filepath.Join(initDir, m.serviceName),
 	}
-	if mem := readProcField(pid, "VmRSS:"); mem != "" {
+	// 优先读 cgroup：语义与 systemd 版一致（memory.current 含 page cache，
+	// cpu.stat 的 usage_usec 覆盖全部线程/进程）。memory 控制器在 ImmortalWrt
+	// 上默认未启用，读不到时回退到 /proc 的 VmRSS / utime+stime。
+	if mem := cgroupMemoryBytes(pid); mem > 0 {
+		status.MemoryBytes = mem
+	} else if mem := readProcField(pid, "VmRSS:"); mem != "" {
 		status.MemoryBytes = parseMemoryKB(mem)
 	}
 	if tasks := readProcField(pid, "Threads:"); tasks != "" {
@@ -65,7 +70,9 @@ func (m *procdManager) Status(ctx context.Context) (Status, error) {
 	if cmdline := readProcCmdline(pid); cmdline != "" {
 		status.ExecStartPath = cmdline
 	}
-	if cpuTime := readProcCPUTime(pid); cpuTime > 0 {
+	if cpuTime := cgroupCPUTime(pid); cpuTime > 0 {
+		status.CPUUsageNanoseconds = cpuTime
+	} else if cpuTime := readProcCPUTime(pid); cpuTime > 0 {
 		status.CPUUsageNanoseconds = cpuTime
 	}
 	return status, nil
@@ -216,6 +223,96 @@ func parseMemoryKB(value string) uint64 {
 		return 0
 	}
 	return kb * 1024
+}
+
+// cgroupCPUTime 读取进程所属 cgroup 的累计 CPU 使用时间（纳秒）。
+//
+// 语义与 systemd 版的 CPUUsageNSec 一致：cpu.stat 的 usage_usec 覆盖 cgroup
+// 内全部线程/进程，而 /proc/PID/stat 只含主线程，多线程进程会少算。读不到
+// cgroup（内存控制器未启用只影响 memory，cpu 控制器默认开启）时返回 0。
+func cgroupCPUTime(pid int) uint64 {
+	usage, ok := cgroupField(pid, "cpu.stat", "usage_usec")
+	if !ok {
+		return 0
+	}
+	if usage > math.MaxUint64/1000 {
+		return 0
+	}
+	return usage * 1000
+}
+
+// cgroupMemoryBytes 读取进程所属 cgroup 的当前内存占用（字节）。
+//
+// 语义与 systemd 版的 MemoryCurrent 一致：memory.current 含 page cache 与
+// 内核内存。ImmortalWrt 默认未启用 memory 控制器，此时读不到、返回 0，
+// 由调用方回退到 VmRSS。
+func cgroupMemoryBytes(pid int) uint64 {
+	value, ok := cgroupField(pid, "memory.current", "")
+	if !ok {
+		return 0
+	}
+	return value
+}
+
+// cgroupField 在进程所属 cgroup 的指定文件里查找键值对；key 为空时把文件
+// 内容当作单个数值返回（如 memory.current）。
+//
+// 路径来自 /proc/PID/cgroup 的 "0::/services/dae/instance1" 形式，
+// 对应 /sys/fs/cgroup/services/dae/instance1。无法解析时返回 ok=false，
+// 调用方必须回退到 /proc 统计。
+func cgroupField(pid int, fileName, key string) (uint64, bool) {
+	content, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cgroup"))
+	if err != nil {
+		return 0, false
+	}
+	dir := parseCgroupDir(string(content))
+	if dir == "" {
+		return 0, false
+	}
+	data, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", dir, fileName))
+	if err != nil {
+		return 0, false
+	}
+	if key == "" {
+		value, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return value, true
+	}
+	return parseCgroupField(string(data), key)
+}
+
+// parseCgroupDir 从 /proc/PID/cgroup 内容里提取 cgroup v2 绝对路径。
+// 形如 "0::/services/dae/instance1"；可能有多行，取第一个 v2 路径。
+func parseCgroupDir(content string) string {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "0::") {
+			continue
+		}
+		dir := strings.TrimSpace(strings.TrimPrefix(line, "0::"))
+		if dir != "" && dir != "/" {
+			return dir
+		}
+	}
+	return ""
+}
+
+// parseCgroupField 从 cgroup 文件的键值对内容里取出指定键的数值。
+// 形如 "usage_usec 123456\nuser_usec 654321"。
+func parseCgroupField(content, key string) (uint64, bool) {
+	for _, line := range strings.Split(content, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == key {
+			value, err := strconv.ParseUint(fields[1], 10, 64)
+			if err != nil {
+				return 0, false
+			}
+			return value, true
+		}
+	}
+	return 0, false
 }
 
 // parseLogread 解析 logread 输出，过滤出指定服务的日志。
