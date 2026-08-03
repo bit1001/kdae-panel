@@ -130,19 +130,51 @@ func (m *procdManager) findPID(ctx context.Context) (int, error) {
 	if pidStr == "" {
 		return 0, fmt.Errorf("未找到进程")
 	}
-	pidStr = strings.Fields(pidStr)[0]
-	pid, err := strconv.Atoi(pidStr)
-	if err != nil {
-		return 0, fmt.Errorf("解析 PID %q: %w", pidStr, err)
+	return m.selectPID(strings.Fields(pidStr))
+}
+
+// selectPID 从 pidof 返回的候选 PID 中选出 procd 管理的服务主进程。
+//
+// pidof 可能同时返回面板自身为探测而临时启动的同名子进程（如 "dae --version"），
+// 它们只是瞬时存在，不是 procd 管理的服务主进程。procd 管理的实例其父进程是
+// PID 1，优先选择它；都不满足时回退到第一个合法候选。
+func (m *procdManager) selectPID(fields []string) (int, error) {
+	readComm := func(pid int) string {
+		content, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
+		if err != nil {
+			return ""
+		}
+		return strings.TrimSuffix(strings.TrimSpace(string(content)), "\n")
 	}
-	// 校验进程名是否匹配，避免 pidof 误匹配（如 busybox pidof 可能因可执行文件路径含关键字而返回无关进程）。
-	if comm, _ := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm")); len(comm) > 0 {
-		name := strings.TrimSuffix(strings.TrimSpace(string(comm)), "\n")
-		if name != m.serviceName {
-			return 0, fmt.Errorf("PID %d 进程名 %q 与期望 %q 不匹配", pid, name, m.serviceName)
+	readPPid := func(pid int) string {
+		return readProcField(pid, "PPid:")
+	}
+	return selectProcdPID(fields, m.serviceName, readComm, readPPid)
+}
+
+// selectProcdPID 为 selectPID 的纯函数实现，便于单测。
+func selectProcdPID(fields []string, serviceName string, readComm func(int) string, readPPid func(int) string) (int, error) {
+	var fallback int
+	for _, field := range fields {
+		pid, err := strconv.Atoi(field)
+		if err != nil {
+			return 0, fmt.Errorf("解析 PID %q: %w", field, err)
+		}
+		// 校验进程名是否匹配，避免 pidof 误匹配（如 busybox pidof 可能因可执行文件路径含关键字而返回无关进程）。
+		if name := readComm(pid); name != "" && name != serviceName {
+			continue
+		}
+		if fallback == 0 {
+			fallback = pid
+		}
+		if readPPid(pid) == "1" {
+			return pid, nil
 		}
 	}
-	return pid, nil
+	if fallback == 0 {
+		return 0, fmt.Errorf("PID %q 进程名与期望 %q 不匹配", strings.Join(fields, " "), serviceName)
+	}
+	return fallback, nil
 }
 
 func (m *procdManager) run(ctx context.Context, name string, args ...string) (command.Result, error) {
